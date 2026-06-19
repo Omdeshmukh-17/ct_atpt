@@ -1,0 +1,14 @@
+# CT-ATPT runtime dependencies.
+#
+# IMPORTANT: install torch SEPARATELY first, matched to the box's CUDA version,
+# e.g.:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# (check `nvidia-smi` for the CUDA version; cu118 / cu121 / cu124 are common).
+# Then:  pip install -r requirements.txt
+#
+# torch/torchvision are listed unpinned here so this file doesn't fight the
+# CUDA-specific wheel you installed above. If the box already has them, pip skips.
+torch
+torchvision
+numpy
+pandas
+scikit-learn

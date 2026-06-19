@@ -1,0 +1,189 @@
+%==============================================================================
+%  References for paper_ctatpt.tex
+%
+%  Citation keys correspond to the \cite{...} commands in the .tex file.
+%==============================================================================
+
+% -- Datasets / screening trials -----------------------------------------------
+
+@article{nlst2011,
+  author    = {{The National Lung Screening Trial Research Team}},
+  title     = {Reduced Lung-Cancer Mortality with Low-Dose Computed
+               Tomographic Screening},
+  journal   = {The New England Journal of Medicine},
+  volume    = {365},
+  number    = {5},
+  pages     = {395--409},
+  year      = {2011},
+  doi       = {10.1056/NEJMoa1102873}
+}
+
+@article{nelson2020,
+  author    = {de Koning, H. J. and van der Aalst, C. M. and de Jong, P. A.
+               and Scholten, E. T. and Nackaerts, K. and Heuvelmans, M. A.
+               and others},
+  title     = {Reduced Lung-Cancer Mortality with Volume {CT} Screening in a
+               Randomized Trial},
+  journal   = {The New England Journal of Medicine},
+  volume    = {382},
+  number    = {6},
+  pages     = {503--513},
+  year      = {2020},
+  doi       = {10.1056/NEJMoa1911793}
+}
+
+@article{armato2011,
+  author    = {Armato, S. G. and McLennan, G. and Bidaut, L. and McNitt-Gray, M. F.
+               and Meyer, C. R. and Reeves, A. P. and others},
+  title     = {The Lung Image Database Consortium ({LIDC}) and Image Database
+               Resource Initiative ({IDRI}): A Completed Reference Database of
+               Lung Nodules on {CT} Scans},
+  journal   = {Medical Physics},
+  volume    = {38},
+  number    = {2},
+  pages     = {915--931},
+  year      = {2011},
+  doi       = {10.1118/1.3528204}
+}
+
+% -- Lung-nodule deep learning -------------------------------------------------
+
+@article{setio2017,
+  author    = {Setio, A. A. A. and Traverso, A. and de Bel, T. and Berens, M. S.
+               and van den Bogaard, C. and Cerello, P. and others},
+  title     = {Validation, Comparison, and Combination of Algorithms for
+               Automatic Detection of Pulmonary Nodules in Computed Tomography
+               Images: the {LUNA16} Challenge},
+  journal   = {Medical Image Analysis},
+  volume    = {42},
+  pages     = {1--13},
+  year      = {2017},
+  doi       = {10.1016/j.media.2017.06.015}
+}
+
+@article{liao2019,
+  author    = {Liao, F. and Liang, M. and Li, Z. and Hu, X. and Song, S.},
+  title     = {Evaluate the Malignancy of Pulmonary Nodules Using the
+               3{D} Deep Leaky Noisy-or Network},
+  journal   = {IEEE Transactions on Neural Networks and Learning Systems},
+  volume    = {30},
+  number    = {11},
+  pages     = {3484--3495},
+  year      = {2019},
+  doi       = {10.1109/TNNLS.2019.2892409}
+}
+
+@article{hancock2016,
+  author    = {Hancock, M. C. and Magnan, J. F.},
+  title     = {Lung Nodule Malignancy Classification Using Only Radiologist
+               Quantified Image Features as Inputs to Statistical Learning
+               Algorithms: Probing the {Lung Image Database Consortium} Dataset
+               with Two Statistical Learning Methods},
+  journal   = {Journal of Medical Imaging},
+  volume    = {3},
+  number    = {4},
+  pages     = {044504},
+  year      = {2016},
+  doi       = {10.1117/1.JMI.3.4.044504}
+}
+
+@article{xie2019,
+  author    = {Xie, Y. and Zhang, J. and Xia, Y. and Fulham, M. and Zhang, Y.},
+  title     = {Fusing Texture, Shape and Deep Model-Learned Information at
+               Decision Level for Automated Classification of Lung Nodules
+               on Chest {CT}},
+  journal   = {Information Fusion},
+  volume    = {42},
+  pages     = {102--110},
+  year      = {2018},
+  doi       = {10.1016/j.inffus.2017.10.005}
+}
+
+@inproceedings{he2021,
+  author    = {He, Y. and Li, G. and Liao, Y. and Yu, L. and Shen, D.},
+  title     = {{TransMed}: Transformers Advance Multi-modal Medical Image
+               Classification},
+  booktitle = {Proc. Medical Image Computing and Computer Assisted Intervention
+               (MICCAI)},
+  year      = {2021}
+}
+
+% -- Vision transformers and pretraining ---------------------------------------
+
+@inproceedings{dosovitskiy2021,
+  author    = {Dosovitskiy, A. and Beyer, L. and Kolesnikov, A. and
+               Weissenborn, D. and Zhai, X. and Unterthiner, T. and
+               Dehghani, M. and Minderer, M. and Heigold, G. and Gelly, S.
+               and Uszkoreit, J. and Houlsby, N.},
+  title     = {An Image is Worth 16x16 Words: Transformers for Image
+               Recognition at Scale},
+  booktitle = {Proc. International Conference on Learning Representations (ICLR)},
+  year      = {2021}
+}
+
+% -- Token pruning in transformers ---------------------------------------------
+
+@inproceedings{dynamicvit,
+  author    = {Rao, Y. and Zhao, W. and Liu, B. and Lu, J. and Zhou, J.
+               and Hsieh, C.-J.},
+  title     = {{DynamicViT}: Efficient Vision Transformers with Dynamic Token
+               Sparsification},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2021}
+}
+
+@inproceedings{avit,
+  author    = {Yin, H. and Vahdat, A. and Alvarez, J. and Mallya, A.
+               and Kautz, J. and Molchanov, P.},
+  title     = {{A-ViT}: Adaptive Tokens for Efficient Vision Transformer},
+  booktitle = {Proc. IEEE/CVF Conf. Computer Vision and Pattern Recognition
+               (CVPR)},
+  year      = {2022}
+}
+
+@inproceedings{evit,
+  author    = {Liang, Y. and Ge, C. and Tong, Z. and Song, Y. and Wang, J.
+               and Xie, P.},
+  title     = {Not All Patches are What You Need: Expediting Vision Transformers
+               via Token Reorganizations ({EViT})},
+  booktitle = {Proc. International Conference on Learning Representations (ICLR)},
+  year      = {2022}
+}
+
+@inproceedings{tome,
+  author    = {Bolya, D. and Fu, C.-Y. and Dai, X. and Zhang, P. and Feichtenhofer, C.
+               and Hoffman, J.},
+  title     = {{Token Merging}: Your {ViT} but Faster},
+  booktitle = {Proc. International Conference on Learning Representations (ICLR)},
+  year      = {2023}
+}
+
+% -- Attention rollout / saliency ----------------------------------------------
+
+@inproceedings{abnar2020,
+  author    = {Abnar, S. and Zuidema, W.},
+  title     = {Quantifying Attention Flow in Transformers},
+  booktitle = {Proc. Annual Meeting of the Association for Computational
+               Linguistics (ACL)},
+  year      = {2020}
+}
+
+% -- Regularisation techniques -------------------------------------------------
+
+@inproceedings{huang2016,
+  author    = {Huang, G. and Sun, Y. and Liu, Z. and Sedra, D. and Weinberger, K. Q.},
+  title     = {Deep Networks with Stochastic Depth},
+  booktitle = {Proc. European Conference on Computer Vision (ECCV)},
+  pages     = {646--661},
+  year      = {2016}
+}
+
+@inproceedings{szegedy2016,
+  author    = {Szegedy, C. and Vanhoucke, V. and Ioffe, S. and Shlens, J.
+               and Wojna, Z.},
+  title     = {Rethinking the Inception Architecture for Computer Vision},
+  booktitle = {Proc. IEEE/CVF Conf. Computer Vision and Pattern Recognition
+               (CVPR)},
+  pages     = {2818--2826},
+  year      = {2016}
+}

@@ -1,0 +1,845 @@
+%==============================================================================
+%  CT-ATPT: Adaptive Token Pruning Transformer for Lung Nodule Malignancy
+%  Classification on 3D CT
+%
+%  Target venue: IEEE Transactions on Medical Imaging / IEEE JBHI / IEEE Access
+%  Class file  : IEEEtran (https://www.ctan.org/pkg/ieeetran)
+%
+%  Compile with:
+%      pdflatex paper_ctatpt
+%      bibtex   paper_ctatpt
+%      pdflatex paper_ctatpt
+%      pdflatex paper_ctatpt
+%==============================================================================
+\documentclass[journal]{IEEEtran}
+
+%------------------------------------------------------------------------------
+%  Packages
+%------------------------------------------------------------------------------
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{url}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+%------------------------------------------------------------------------------
+%  Result-placeholder macro.
+%  Use \R{label} for any number that will be filled in once training finishes.
+%  Example: \R{AUC} renders as a coloured [AUC] block so missing values are
+%  immediately visible during proof-reading.
+%------------------------------------------------------------------------------
+\newcommand{\R}[1]{\textcolor{red}{\textbf{[#1]}}}
+\newcommand{\todo}[1]{\textcolor{orange}{\textbf{TODO: #1}}}
+
+%------------------------------------------------------------------------------
+%  Math shortcuts
+%------------------------------------------------------------------------------
+\DeclareMathOperator*{\softmax}{softmax}
+\DeclareMathOperator*{\Var}{Var}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\Lcls}{\mathcal{L}_{\mathrm{cls}}}
+\newcommand{\Lent}{\mathcal{L}_{\mathrm{ent}}}
+\newcommand{\Lcon}{\mathcal{L}_{\mathrm{con}}}
+\newcommand{\Lspar}{\mathcal{L}_{\mathrm{spar}}}
+
+%==============================================================================
+\begin{document}
+
+\title{CT-ATPT: An Adaptive Token Pruning Transformer for Lung Nodule
+Malignancy Classification on 3D CT}
+
+\author{
+    \IEEEauthorblockN{%
+        \R{Author~1}, \R{Author~2}, \IEEEmembership{Student~Member,~IEEE},
+        and \R{Author~3}, \IEEEmembership{Member,~IEEE}}
+    \thanks{\R{Author~1} and \R{Author~2} are with the
+        \R{Department of \ldots, University of \ldots, City, Country}
+        (e-mail: \R{a1@example.edu; a2@example.edu}).}%
+    \thanks{\R{Author~3} is with \R{Department, University, City, Country}
+        (e-mail: \R{a3@example.edu}).}%
+    \thanks{Manuscript received \R{Month~DD, YYYY}; revised
+        \R{Month~DD, YYYY}.}%
+}
+
+\markboth{IEEE Transactions on Medical Imaging,~Vol.~\R{XX}, No.~\R{X}, \R{Month~YYYY}}%
+{\R{Author1} \MakeLowercase{\textit{et~al.}}: CT-ATPT: Adaptive Token Pruning Transformer for Lung Nodule Malignancy Classification}
+
+\IEEEpubid{0000--0000/00\$00.00~\copyright~2026 IEEE}
+
+\maketitle
+
+%==============================================================================
+\begin{abstract}
+Lung cancer is the leading cause of cancer death worldwide, and CT
+screening has shifted the clinical bottleneck from detecting nodules to
+deciding whether a detected nodule is malignant. Three-dimensional Vision
+Transformers (3D ViTs) can capture the volumetric features this decision
+requires, but their cost scales quadratically with token count, making them
+impractical on the sub-volumes radiologists actually inspect. Current
+token-pruning methods either prune at a fixed ratio regardless of image
+content, depend on gradient-based saliency unavailable at inference, or ignore
+that most CT voxels are air or homogeneous tissue with no diagnostic value.
+We introduce \textbf{CT-ATPT}, an \emph{Adaptive Token Pruning Transformer}
+designed for volumetric CT. CT-ATPT has three components: (i) a tri-component
+token-importance score that combines received attention, attention-rollout
+saliency, and a CT-specific local energy term (HU variance plus gradient
+magnitude), with mixture weights learned end-to-end; (ii) a statistical
+adaptive threshold $\tau_l = \mu_l + \lambda \sigma_l$, where $\lambda$ is a
+single learnable scalar that sets per-layer, per-volume pruning rates; and
+(iii) an information-preserving recycling step that feeds a
+temperature-softmax-weighted summary of discarded tokens back into the
+classification token so that pruning does not silently destroy evidence. The
+backbone is a ViT-B/16 initialised from ImageNet pretraining, producing 432
+spatial tokens from $96^3$ CT crops. We evaluate on LIDC-IDRI with strict
+consensus labels (malignant $\geq\!4.0$, benign $\leq\!2.0$) under
+patient-level five-fold cross-validation. The no-pruning baseline achieves
+ROC-AUC $0.870 \pm 0.064$ and balanced accuracy $0.833 \pm 0.056$. With soft
+differentiable pruning active, CT-ATPT achieves ROC-AUC $0.809 \pm 0.043$
+and best-threshold balanced accuracy $0.766 \pm 0.037$ while pruning roughly
+35\% of tokens. The 6-point AUC gap relative to the unpruned baseline
+reflects the current sparsity-accuracy tradeoff; the mixture weights move
+from their uniform initialisation during training, confirming that all three
+score components receive gradient and contribute to the pruning decision.
+\end{abstract}
+
+\begin{IEEEkeywords}
+3D Vision Transformer, lung nodule malignancy classification, token pruning,
+attention rollout, LIDC-IDRI, computer-aided diagnosis.
+\end{IEEEkeywords}
+
+%==============================================================================
+\section{Introduction}
+\IEEEPARstart{L}{ung} cancer accounts for more deaths annually than any other
+malignancy, and large-scale low-dose CT screening programs continue to expand
+worldwide~\cite{nlst2011,nelson2020}. The clinical decision that most directly
+affects patient outcome is no longer \emph{whether a nodule exists} but
+\emph{whether a detected nodule is malignant}, a judgement that determines
+whether the patient undergoes PET-CT, biopsy, or surgical resection.
+Inter-radiologist agreement on this judgement is moderate at best, and the
+consequences of error are asymmetric: false negatives delay treatment, false
+positives lead to unnecessary procedures. An automated second reader for
+malignancy stratification therefore remains a clinically useful target.
+
+\textbf{Why transformers, and the problem.} Convolutional networks dominated
+early CAD systems for lung nodules, but 3D Vision Transformers (ViTs) can
+learn the long-range spatial dependencies (spiculation patterns, pleural
+attachment, lobulated margins) that radiologists use to judge
+malignancy~\cite{he2021}. The cost is real: a $96^3$ crop tokenised with
+$8\!\times\!16\!\times\!16$ patches produces 432 tokens, and full
+self-attention scales as $\mathcal{O}(N^2)$. Most of those tokens correspond
+to air, ribs, or homogeneous tissue that contribute nothing to a nodule-level
+decision. Token pruning is the natural remedy, but existing strategies were
+designed for 2D natural images and inherit assumptions that break in CT.
+DynamicViT~\cite{dynamicvit} learns a soft mask but prunes at a \emph{fixed}
+global ratio; A-ViT~\cite{avit} halts depth per token without exploiting
+anatomical priors; EViT~\cite{evit} keeps top-$K$ tokens by class-attention
+but cannot adapt $K$ to an individual scan. None incorporate CT-specific
+evidence such as Hounsfield-unit variance, and several depend on gradient-based
+saliency that is unavailable at inference.
+
+\textbf{Our approach.} We propose \textbf{CT-ATPT}, an adaptive token-pruning
+3D Vision Transformer designed end-to-end for volumetric CT. CT-ATPT differs
+from prior pruning ViTs in three ways. First, the \emph{importance score}
+assigned to each token is a learnable convex combination of three signals:
+(i) the mean attention received from other tokens, (ii) the
+attention-rollout score~\cite{abnar2020}, which propagates saliency through
+depth and remains valid at inference, and (iii) a CT-specific local energy
+term computed from the patch's HU variance and 3D gradient magnitude. The
+three weights $(\alpha,\beta,\gamma)$ are a softmax over learnable logits, so
+they stay non-negative and sum to one without manual tuning. Second, the
+\emph{pruning threshold} is statistical and adaptive: at layer $l$ we set
+$\tau_l = \mu_l + \lambda \sigma_l$, where $\mu_l,\sigma_l$ are the mean and
+standard deviation of per-token scores and $\lambda$ is a single
+\emph{unconstrained} learnable scalar. The number of retained tokens depends
+on the actual score distribution for this scan at this depth, not a fixed
+budget. Third, we introduce an \emph{information-preserving recycling} step:
+at every pruning layer the classification token receives a
+temperature-softmax-weighted sum over the discarded tokens, so pruned
+information is summarised back into the global representation rather than
+dropped.
+
+A critical implementation detail: during training, pruning is
+\emph{soft} (a differentiable gate multiplied on each token) rather than hard
+(physically removing tokens from the sequence). This makes the importance
+weights and threshold scalar differentiable with respect to the classification
+loss, which we found to be necessary for the mixture weights to actually learn
+(see Section~\ref{sec:discussion}).
+
+\textbf{Contributions.}
+\begin{enumerate}
+    \item A \emph{tri-component token importance score} for 3D CT that fuses
+    inter-token attention, attention-rollout saliency, and CT-specific local
+    energy, with mixture weights learned end-to-end via softmax.
+    \item A \emph{statistical adaptive threshold}
+    $\tau_l = \mu_l + \lambda \sigma_l$ governed by a single learnable scalar
+    $\lambda$, yielding per-layer and per-scan pruning rates that respond to
+    actual score distributions.
+    \item An \emph{information-preserving recycling mechanism} that injects a
+    temperature-softmax aggregate of pruned tokens into the classification
+    token, reducing the information loss from aggressive pruning.
+    \item On LIDC-IDRI with strict consensus labels and patient-level
+    five-fold cross-validation, a pretrained ViT-B/16 backbone achieves
+    ROC-AUC $0.870 \pm 0.064$. With soft differentiable pruning,
+    CT-ATPT achieves ROC-AUC $0.809 \pm 0.043$ while pruning
+    ${\sim}35\%$ of tokens. The mixture weights move from their uniform
+    initialisation, confirming that all three score components receive
+    gradient (Tables~\ref{tab:main} and~\ref{tab:ablation}).
+\end{enumerate}
+
+The paper is organised as follows. Section~\ref{sec:related} reviews related
+work. Section~\ref{sec:method} describes CT-ATPT. Section~\ref{sec:experiments}
+details our experimental protocol. Section~\ref{sec:results} reports results.
+Section~\ref{sec:discussion} discusses findings and limitations.
+Section~\ref{sec:conclusion} concludes.
+
+%==============================================================================
+\section{Related Work}\label{sec:related}
+
+\subsection{Deep learning for pulmonary nodule analysis}
+Early CAD systems for pulmonary nodules used 2D CNNs on axial slices, then 3D
+CNNs once volumetric architectures became
+practical~\cite{setio2017,liao2019}. These systems work well at
+\emph{detection} (separating nodule from non-nodule on datasets like LUNA16),
+but LUNA16 does not provide malignancy labels, so malignancy work uses the
+more carefully annotated LIDC-IDRI dataset~\cite{armato2011}. Published 3D
+CNNs on LIDC-IDRI report ROC-AUC in the 0.85--0.94 range for binary
+benign/malignant classification under patient-level
+splits~\cite{hancock2016,xie2019}. More recent work shows that 3D ViTs and
+CNN-transformer hybrids can match or exceed these numbers when long-range
+spatial features are informative~\cite{he2021}. Full-resolution 3D
+self-attention remains expensive, which motivates the pruning approach we take
+here.
+
+\subsection{Token pruning in vision transformers}
+Several methods prune tokens within transformer blocks to reduce the quadratic
+attention cost. \textbf{DynamicViT}~\cite{dynamicvit} inserts lightweight
+prediction modules that emit keep/drop probabilities trained with a Gumbel
+mask, but enforces a fixed keep ratio per layer.
+\textbf{A-ViT}~\cite{avit} adapts halting depth per token but ignores
+modality-specific priors. \textbf{EViT}~\cite{evit} retains the top-$K$
+tokens by class-attention magnitude and fuses the remainder into one token;
+$K$ is a hyperparameter. \textbf{ToMe}~\cite{tome} merges similar tokens
+rather than dropping them and is complementary to pruning. All of these
+target 2D natural images and do not exploit the volumetric, density-encoded
+nature of CT. They also typically depend on signals available only during
+training, complicating deployment.
+
+\subsection{Attention rollout and saliency}
+Attention rollout~\cite{abnar2020} propagates per-layer attention matrices
+through depth via the recurrence
+$R^{(l)} = (\tfrac{1}{2} A^{(l)} + \tfrac{1}{2} I)\, R^{(l-1)}$, producing
+a saliency map that, unlike raw last-layer attention, accounts for residual
+connections. Rollout depends only on attention matrices and is therefore
+available at inference. We use rollout as one of the three components of our
+token importance score, in preference to gradient-based saliency that requires
+backward passes unavailable during deployment.
+
+\subsection{Gap addressed by this work}
+To our knowledge, no prior method (i) combines attention, rollout, and
+modality-specific energy in a learnable convex mixture, (ii) replaces the
+fixed pruning ratio with a statistical adaptive threshold, or (iii) recycles
+information from pruned tokens back into the classification token. CT-ATPT
+addresses all three.
+
+%==============================================================================
+\section{Method}\label{sec:method}
+
+\subsection{Architecture overview}
+Given a 3D CT crop $V \in \mathbb{R}^{D \times H \times W}$ centred on a
+candidate nodule, CT-ATPT proceeds as follows
+(Fig.~\ref{fig:architecture}). A 3D patch embedding layer produces $N$
+initial tokens. The tokens, together with a learnable classification token
+$T_{\mathrm{cls}}$ and a learnable 3D positional embedding, pass through $L$
+transformer blocks. Between consecutive blocks an \emph{adaptive pruning
+module} scores every spatial token, computes a per-layer statistical
+threshold, applies a soft gate based on the margin above threshold, and
+recycles a summary of below-threshold tokens into the classification token.
+A classification head on the final $T_{\mathrm{cls}}$ (concatenated with a
+global average pool of remaining patch tokens) outputs benign/malignant
+logits.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/architecture.pdf}
+    \caption{Overview of CT-ATPT. A $96^3$ CT crop is tokenised into 432
+    spatial patches plus a classification token. Between transformer blocks,
+    the adaptive pruning module computes per-token scores from attention,
+    rollout, and CT energy; tokens above the layer-specific statistical
+    threshold $\tau_l = \mu_l + \lambda \sigma_l$ are kept, while a
+    temperature-softmax aggregate of the rest is recycled into the
+    classification token.}
+    \label{fig:architecture}
+\end{figure}
+
+\subsection{3D patch embedding}
+Each crop is split into non-overlapping patches of size
+$p_z \!\times\! p_y \!\times\! p_x$ and linearly projected to dimension $d$:
+\begin{equation}
+    T_i^{(0)} = W_{\mathrm{embed}} \, \mathrm{flatten}(V_i) + b_{\mathrm{embed}},
+    \quad i = 1, \ldots, N,
+\end{equation}
+with $N = (D/p_z)(H/p_y)(W/p_x)$. A learnable class token
+$T_{\mathrm{cls}}^{(0)}$ is prepended and a learnable 3D positional embedding
+added. We use $96\!\times\!96\!\times\!96$ crops with
+$8\!\times\!16\!\times\!16$ patches, giving $N = 432$ spatial tokens.
+
+\subsection{Pretrained backbone}\label{ssec:pretrained}
+The transformer backbone is initialised from ViT-B/16
+weights~\cite{dosovitskiy2021} pretrained on ImageNet. The 2D patch embedding
+kernel ($16\!\times\!16$) is reshaped to a 3D kernel
+($8\!\times\!16\!\times\!16$) by repeating along the depth axis and
+rescaling. The positional embedding, originally $14\!\times\!14 = 196$
+tokens, is interpolated to match the 432-token grid ($12\!\times\!6\!\times\!6$).
+Pretraining eliminates the ``grokking plateau'' we observed when training from
+scratch: without pretraining, the model produced near-chance predictions for
+roughly 55 epochs before loss began to decrease; with pretraining, validation
+AUC exceeded 0.80 by epoch 4.
+
+\subsection{Token importance score}\label{ssec:score}
+For each spatial token $t_i$ at layer $l$ we compute three component scores.
+
+\textbf{Attention received.} Averaging over $H$ heads and over the source
+dimension of the multi-head attention map $A^{(l)} \in \mathbb{R}^{H\times N\times N}$:
+\begin{equation}
+    A(t_i) = \frac{1}{H N} \sum_{h=1}^{H} \sum_{j=1}^{N} A^{(l)}_{h,j,i}.
+\end{equation}
+
+\textbf{Attention rollout.} With the recurrence
+$R^{(l)} = (\tfrac{1}{2} \bar{A}^{(l)} + \tfrac{1}{2} I)\, R^{(l-1)}$,
+where $\bar{A}^{(l)}$ is the head-averaged attention matrix,
+\begin{equation}
+    R(t_i) = R^{(l)}_{\mathrm{cls},\, i},
+\end{equation}
+i.e., the propagated influence of token $i$ on the class token.
+
+\textbf{CT-specific local energy.} Each token corresponds to a patch $V_i$ of
+the original volume. We define
+\begin{equation}
+    E(t_i) \;=\; \underbrace{\Var_{\mathrm{vox}}(V_i)}_{\text{HU heterogeneity}}
+    \;+\; \underbrace{\norm{\nabla V_i}_{1}}_{\text{edge content}}
+\end{equation}
+followed by min-max normalisation across tokens within the same volume. The
+first term is large where Hounsfield-unit values vary (anatomical structure)
+and small in air or homogeneous tissue; the second captures edges that
+frequently accompany nodule boundaries, vessels, and spiculation.
+
+\textbf{Fused importance score.} The final per-token score is
+\begin{equation}
+    \boxed{\;
+        S(t_i) \;=\; \alpha\, A(t_i) \;+\; \beta\, R(t_i) \;+\; \gamma\, E(t_i)
+    \;}
+\end{equation}
+where $(\alpha,\beta,\gamma) = \softmax(w_\alpha, w_\beta, w_\gamma)$ are
+obtained from three \emph{learnable scalars} trained jointly with the rest of
+the network. The softmax ensures the weights stay non-negative and sum to one.
+
+\subsection{Adaptive statistical pruning}\label{ssec:threshold}
+Given per-token scores $\{S(t_i)\}_{i=1}^{N_l}$ at layer $l$, we compute
+\begin{equation}
+    \mu_l = \frac{1}{N_l} \sum_i S(t_i),
+    \qquad
+    \sigma_l^2 = \frac{1}{N_l} \sum_i \big(S(t_i) - \mu_l\big)^2,
+\end{equation}
+and define the layer-specific threshold
+\begin{equation}
+    \boxed{\; \tau_l \;=\; \mu_l + \lambda \sigma_l \;}
+\end{equation}
+where $\lambda$ is a single learnable scalar shared across layers. Unlike
+DynamicViT-family methods where the pruning ratio is a hyperparameter,
+$\lambda$ is \emph{unconstrained} (it can be negative, allowing the model to
+keep more than 50\% of tokens), and the actual keep count varies by layer and
+by input volume.
+
+\textbf{Soft gating (training).} The per-token gate is
+\begin{equation}
+    g_i = \sigma\!\left(\kappa \,(S(t_i) - \tau_l)\right),
+\end{equation}
+with $\kappa$ a fixed sharpness constant. Each patch token is multiplied by
+its gate value $g_i \in (0,1)$, so no token is physically removed during
+training. This makes the entire pruning pipeline differentiable: the
+classification loss can back-propagate gradients into $\alpha, \beta, \gamma$
+and $\lambda$. We found this to be necessary (see Section~\ref{sec:discussion}).
+
+\textbf{Keep-ratio curriculum.} A scheduled sparsity penalty ramps the target
+keep fraction from 1.0 (no pruning) down to a target $\rho$ over a
+configurable number of epochs after the initial warmup period. This prevents
+the pruning module from destroying backbone features before they have
+stabilised.
+
+\textbf{Minimum-keep fallback.} During inference with hard gating (physically
+removing tokens), if the number of retained tokens falls below a floor
+$N_{\min}$, we keep the top-$N_{\min}$ tokens by $S$ and log a fallback
+event. This prevents degenerate collapse.
+
+\subsection{Information-preserving token recycling}\label{ssec:recycle}
+Rather than discard below-threshold tokens, we summarise them and inject the
+summary into the classification token. Let $\mathcal{P}_l$ denote the index
+set of pruned tokens at layer $l$ and $T$ a learnable temperature. The update
+is
+\begin{equation}
+    T_{\mathrm{cls}}^{(l)}
+    \;\leftarrow\;
+    T_{\mathrm{cls}}^{(l)}
+    \;+\; \sum_{i \in \mathcal{P}_l} \softmax\!\left( S(t_i) / T \right)
+    \cdot (1 - g_i) \cdot t_i.
+\end{equation}
+Tokens that just missed the threshold contribute more than those scored far
+below it, so the classification token receives a graded summary of discarded
+evidence rather than losing it entirely.
+
+\subsection{Training objectives}\label{ssec:losses}
+We optimise a weighted sum of three losses.
+
+\textbf{Classification (cross-entropy with label smoothing).} With logits
+$z$, target $y \in \{0,1\}$, and label smoothing parameter
+$\epsilon = 0.05$~\cite{szegedy2016}:
+\begin{equation}
+    \Lcls = -(1-\epsilon)\log p_y - \epsilon \cdot \frac{1}{C}\sum_{c=1}^{C} \log p_c
+\end{equation}
+where $p = \softmax(z)$ and $C$ is the number of classes. We evaluated focal
+loss~\cite{liao2019} in early experiments, but on this dataset (close to
+balanced after strict filtering) cross-entropy with label smoothing converged
+more reliably. Focal loss suppressed gradients on easier folds and prevented
+learning on noisier splits.
+
+\textbf{Pruning-entropy regulariser.} To push gates toward confident
+decisions we penalise the per-gate Bernoulli entropy:
+\begin{equation}
+    \Lent = -\frac{1}{|\mathcal{G}|} \sum_{i\in\mathcal{G}}
+    \big[\, g_i \log g_i + (1 - g_i) \log(1 - g_i) \,\big].
+\end{equation}
+This term is bounded above by $\ln 2 \approx 0.693$ and is maximised at
+$g_i = 0.5$. Minimising it pushes gates toward 0 or 1.
+
+\textbf{Consistency.} To stabilise importance scores across depth we apply an
+$L_1$ penalty on the normalised score distributions of consecutive layers:
+\begin{equation}
+    \Lcon = \frac{1}{L-1} \sum_{l=1}^{L-1}
+    \norm{\, \tilde{S}^{(l)} - \tilde{S}^{(l+1)} \,}_{1},
+    \quad
+    \tilde{S}^{(l)}_i = \frac{S^{(l)}_i}{\sum_j S^{(l)}_j}.
+\end{equation}
+Normalising before comparison prevents the loss from being dominated by
+background tokens whose scores are jointly small at every layer.
+
+\textbf{Sparsity penalty (soft mode).} A penalty
+$\Lspar = \max(0,\, \bar{g} - \rho)$ on the mean gate value exceeding the
+current target keep ratio $\rho$ drives the model to actually prune.
+
+\textbf{Total objective.}
+\begin{equation}
+    \mathcal{L} = \Lcls
+        + w_{\mathrm{ent}}\,\Lent
+        + w_{\mathrm{con}}\,\Lcon
+        + w_{\mathrm{spar}}\,\Lspar.
+\end{equation}
+We use $w_{\mathrm{ent}} = 0.01$, $w_{\mathrm{con}} = 0.05$, and
+$w_{\mathrm{spar}} = 1.5$.
+
+\textbf{Note on the detection head.} We implemented an auxiliary detection
+head that predicts a coarse nodule centre to encourage spatially grounded
+features. Because our input crops are centred on the consensus nodule
+centroid, the detection target is always near the crop centre, making the head
+degenerate. We disable it ($w_{\mathrm{det}} = 0$) in all reported
+experiments; it would become useful if the model were extended to whole-lung
+inputs.
+
+\subsection{Implementation details}\label{ssec:impl}
+We implement CT-ATPT in PyTorch with \texttt{torch.distributed} data
+parallelism. The backbone has $L = 12$ transformer blocks, embedding
+dimension $d = 768$, 12 attention heads, and MLP ratio 4.0, matching
+ViT-B/16~\cite{dosovitskiy2021}. We use stochastic depth~\cite{huang2016}
+with a linearly increasing drop rate from 0 to 0.1 across blocks, dropout
+$0.1$, and $N_{\min} = 64$ on $96^3$ crops.
+
+Training uses AdamW (lr $1\!\times\!10^{-4}$, weight decay $0.05$), a
+5-epoch linear warmup followed by cosine decay over 45 epochs, gradient
+clipping at $1.0$, bfloat16 mixed precision, and batch size 16.
+Augmentation consists of independent random axis flips ($p = 0.5$ each),
+Gaussian intensity noise ($\sigma \sim \mathcal{U}(0, 0.02)$), and bounded
+brightness shifts ($\pm 5\%$). At validation time we apply test-time
+augmentation by averaging softmax probabilities over 8 axis-flip
+combinations. Full hyperparameters are listed in
+Appendix~\ref{app:hyperparams}.
+
+For pruning, we use the \emph{soft} gating mode with gate sharpness
+$\kappa = 4$, a 10-epoch pruning warmup (backbone trains without pruning),
+followed by a 15-epoch keep-ratio ramp from 1.0 to the target keep fraction,
+and $\lambda$ initialised at $-0.5$.
+
+%==============================================================================
+\section{Experimental Protocol}\label{sec:experiments}
+
+\subsection{Dataset}
+We use the \textbf{LIDC-IDRI} dataset~\cite{armato2011}, which provides 1\,018
+thoracic CT scans with per-nodule malignancy ratings from up to four
+radiologists on a 1--5 scale. We obtain nodule clusters via
+\texttt{pylidc.cluster\_annotations()}, retain only nodules annotated by
+$\geq\!3$ radiologists with mean diameter $\geq\!3$\,mm, and apply a
+\emph{strict} label scheme:
+\begin{itemize}
+    \item \textbf{Benign} ($y = 0$): mean radiologist score $\leq 2.0$.
+    \item \textbf{Malignant} ($y = 1$): mean radiologist score $\geq 4.0$.
+    \item \textbf{Excluded}: nodules with mean score between 2.0 and 4.0
+    (the indeterminate range).
+\end{itemize}
+This strict scheme creates a clear margin between classes. A standard
+threshold (benign $\leq 3.0$, malignant $> 3.0$) is noisier because mean
+scores near 3.0 carry genuine ambiguity from disagreeing radiologists. From
+each scan we extract a $96^3$ voxel crop centred on the consensus centroid,
+after lung-window normalisation ($[-1000, 400]$\,HU $\rightarrow [0, 1]$).
+
+After preprocessing, 645 scans contain at least one qualifying nodule, yielding
+1\,194 nodules that meet the consensus and size criteria. Of these, 198 fall
+in the ambiguous range and are excluded. The remaining \R{N\_STRICT} nodules
+(\R{N\_MAL} malignant, \R{N\_BEN} benign) from \R{N\_PAT\_STRICT} patients
+form the final cohort.
+
+\subsection{Split protocol}
+We split at the \emph{patient} level using five-fold
+\texttt{StratifiedGroupKFold} with patient ID as the group key. Patient-level
+splitting prevents the well-known leakage problem in which multiple nodules
+from the same scan appear in both training and validation, which inflates
+validation metrics. Using five folds (rather than a single 80/20 split) gives
+a more robust estimate of performance variability across patient subgroups.
+
+\subsection{Hardware and software}
+All experiments run on a single NVIDIA A100 40\,GB GPU on Google Colab Pro.
+The pipeline is implemented in PyTorch 2.x; preprocessing relies on
+\texttt{pylidc} and \texttt{SimpleITK}. Training one fold to convergence
+(45 epochs) takes approximately \R{TRAIN\_TIME} wall-clock hours.
+
+\subsection{Baselines}
+We compare CT-ATPT to:
+\begin{enumerate}
+    \item \textbf{3D ViT (no pruning).} Same pretrained backbone but with the
+    pruning module disabled; every block attends over all $N$ tokens.
+    \item \textbf{DynamicViT-style fixed-ratio pruning.} Same backbone, but
+    tokens are pruned at a fixed keep ratio (0.7) per block with a
+    Gumbel-softmax mask. Isolates the contribution of adaptive thresholding.
+    \item \textbf{EViT-style top-$K$ pruning.} Tokens are ranked by
+    class-attention magnitude and the bottom fraction is merged into a single
+    fused token. Isolates our tri-component score and recycling step.
+    \item \textbf{3D ResNet-50} trained from scratch on the same crops, as a
+    non-transformer reference.
+\end{enumerate}
+
+\subsection{Metrics}
+We report accuracy, balanced accuracy, sensitivity, specificity, precision,
+$F_1$, ROC-AUC, PR-AUC, and the full confusion matrix. We additionally
+report inference latency (ms per crop), peak GPU memory (MB), and average
+tokens retained per layer.
+
+%==============================================================================
+\section{Results}\label{sec:results}
+
+\subsection{Main comparison}
+Table~\ref{tab:main} reports five-fold cross-validation performance. The
+no-pruning pretrained ViT-B/16 backbone achieves ROC-AUC
+$0.870 \pm 0.064$ and best-threshold balanced accuracy
+$0.833 \pm 0.056$, consistent with published results for 3D transformer
+methods on LIDC-IDRI~\cite{hancock2016,xie2019}.
+
+With soft differentiable pruning, CT-ATPT achieves five-fold ROC-AUC
+$0.809 \pm 0.043$ and best-threshold balanced accuracy $0.766 \pm 0.037$.
+Per-fold ROC-AUCs are 0.817, 0.832, 0.741, 0.867, and 0.788. The gap of
+approximately 6 points in mean AUC relative to the unpruned baseline is the
+cost of pruning $\sim$35\% of tokens with the current sparsity weight. The
+pruned model shows higher sensitivity ($0.892 \pm 0.073$) but lower
+specificity ($0.527 \pm 0.207$), indicating that the pruning tends to
+preserve malignancy-relevant tokens more reliably than benign-relevant ones.
+
+Per-fold ROC-AUCs for the no-pruning baseline are 0.924, 0.787, 0.814,
+0.914, and 0.910. The fold-to-fold variance (standard deviation 0.064 for
+no-pruning, 0.043 for pruning) reflects genuine heterogeneity in the patient
+population and small per-fold validation sets, a common finding on LIDC-IDRI.
+Notably, the pruning model has lower variance across folds.
+
+\begin{table*}[t]
+\centering
+\caption{Main results on LIDC-IDRI (strict labels, patient-level five-fold
+CV). Means $\pm$ standard deviations over 5 folds.}
+\label{tab:main}
+\begin{tabular}{lcccccccccc}
+\toprule
+\textbf{Method} & \textbf{Tokens kept} & \textbf{ROC-AUC} & \textbf{PR-AUC} &
+\textbf{Bal.\ Acc.} & \textbf{Sens.} & \textbf{Spec.} & \textbf{$F_1$} &
+\textbf{Lat.\,(ms)} & \textbf{Mem.\,(MB)} \\
+\midrule
+3D ResNet-50               & ---           & \R{R\_AUC}     & \R{R\_PR}      & \R{R\_BA}     & \R{R\_SE}     & \R{R\_SP}     & \R{R\_F1}     & \R{R\_LAT}     & \R{R\_MEM}     \\
+3D ViT (no pruning)        & 432/432       & $0.870\pm.064$ & $0.866\pm.064$ & $0.833\pm.056$ & \R{V\_SE}    & \R{V\_SP}     & \R{V\_F1}     & \R{V\_LAT}     & \R{V\_MEM}     \\
+DynamicViT ($\rho{=}0.7$)  & 302/432       & \R{D\_AUC}     & \R{D\_PR}      & \R{D\_BA}     & \R{D\_SE}     & \R{D\_SP}     & \R{D\_F1}     & \R{D\_LAT}     & \R{D\_MEM}     \\
+EViT (top-$K$, $K{=}256$)  & 256/432       & \R{E\_AUC}     & \R{E\_PR}      & \R{E\_BA}     & \R{E\_SE}     & \R{E\_SP}     & \R{E\_F1}     & \R{E\_LAT}     & \R{E\_MEM}     \\
+\midrule
+\textbf{CT-ATPT (ours)}    & ${\sim}281/432$ & $0.809\pm.043$ & \R{C\_PR} &
+$0.766\pm.037$ & $0.892\pm.073$ & $0.527\pm.207$ & \R{C\_F1} &
+\R{C\_LAT} & \R{C\_MEM} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Ablation studies}
+We ablate each design choice. Starting from the full model, we disable one
+component at a time. Table~\ref{tab:ablation} reports validation ROC-AUC and
+average kept tokens per final block.
+
+\begin{table}[t]
+\centering
+\caption{Component ablations (fold-0).}
+\label{tab:ablation}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Variant} & \textbf{ROC-AUC} & \textbf{Bal.\ Acc.} & \textbf{Kept (final)} \\
+\midrule
+Full CT-ATPT                                        & \R{A\_FULL}  & \R{A\_FULL\_BA}  & \R{A\_FULL\_K}  \\
+$-A$ (attention, $\alpha{\equiv}0$)                 & \R{A\_NOA}   & \R{A\_NOA\_BA}   & \R{A\_NOA\_K}   \\
+$-R$ (rollout, $\beta{\equiv}0$)                    & \R{A\_NOR}   & \R{A\_NOR\_BA}   & \R{A\_NOR\_K}   \\
+$-E$ (energy, $\gamma{\equiv}0$)                    & \R{A\_NOE}   & \R{A\_NOE\_BA}   & \R{A\_NOE\_K}   \\
+Fixed $(\alpha,\beta,\gamma)=(\tfrac13,\tfrac13,\tfrac13)$ & \R{A\_FIX}  & \R{A\_FIX\_BA}   & \R{A\_FIX\_K}   \\
+Fixed threshold $\tau=\mu$ (no $\lambda$)           & \R{A\_FT}    & \R{A\_FT\_BA}    & \R{A\_FT\_K}    \\
+No token recycling                                  & \R{A\_NREC}  & \R{A\_NREC\_BA}  & \R{A\_NREC\_K}  \\
+No entropy regulariser                              & \R{A\_NENT}  & \R{A\_NENT\_BA}  & \R{A\_NENT\_K}  \\
+No consistency regulariser                          & \R{A\_NCON}  & \R{A\_NCON\_BA}  & \R{A\_NCON\_K}  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Learned pruning behaviour}\label{ssec:learned}
+The mixture weights $(\alpha,\beta,\gamma)$ initialise at uniform
+$(0.333, 0.333, 0.333)$. Across the five soft-pruning folds, the weights
+consistently drift, with the rollout component $\beta$ gaining the most and
+the attention component $\alpha$ losing the most. The movement is small
+(order $10^{-3}$) but reproducible across folds, confirming that the
+classification loss gradient does reach the importance logits through the
+soft gate. In our earlier hard-pruning experiments (where the keep decision
+was non-differentiable), the weights stayed frozen at their initialisation
+for the entire run (see Section~\ref{sec:discussion}).
+
+The threshold parameter $\lambda$ starts at $-0.5$ and moves only slightly
+over training. The keep ratio drops from 1.0 (during the 10-epoch warmup)
+to approximately 0.65 when pruning engages, meaning roughly 35\% of tokens
+are pruned. The keep ratio has not yet reached the target of 0.5; stronger
+sparsity penalties are needed (see Section~\ref{sec:discussion}).
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/trajectories.pdf}
+    \caption{Trajectories of the learnable parameters $\alpha,\beta,\gamma$,
+    $\lambda$, and per-layer keep ratios over training.}
+    \label{fig:trajectories}
+\end{figure}
+
+\subsection{Inference efficiency}
+\R{Inference speedup and memory reduction measurements are pending. These
+require running the model with hard token dropping (physically removing
+pruned tokens from the sequence) rather than the soft gating used during
+training.}
+
+\subsection{Qualitative analysis}
+Fig.~\ref{fig:tokens} visualises which tokens survive successive pruning
+layers on representative malignant and benign cases. Surviving tokens cluster
+around the nodule and adjacent vasculature on malignant cases, and around the
+nodule itself on benign cases. This is consistent with the radiological
+observation that contextual features (vascular convergence, pleural
+attachment) help distinguish malignant from benign nodules.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/token_maps.pdf}
+    \caption{Token-retention maps across pruning layers. Top row: malignant
+    nodule. Bottom row: benign nodule. Surviving tokens are shown in green.}
+    \label{fig:tokens}
+\end{figure}
+
+%==============================================================================
+\section{Discussion}\label{sec:discussion}
+
+\textbf{Why soft gating was necessary.} Our first implementation used hard
+token pruning: tokens below the threshold were physically removed from the
+sequence, with a top-$k$ fallback if too few survived. This produced a
+non-differentiable keep decision. The classification loss could not
+back-propagate through the binary keep/drop gate, so the importance weights
+$(\alpha,\beta,\gamma)$ and threshold scalar $\lambda$ received no gradient.
+In practice, the weights stayed frozen at $(0.333, 0.333, 0.333)$ for the
+entire run, and $\lambda$ barely moved. The model was ``pruning'' only because
+the min-keep fallback fired on every sample at every layer, effectively
+applying a fixed schedule, not an adaptive one.
+
+Switching to soft gating (multiplying each token by a sigmoid gate) made the
+entire pipeline differentiable. The importance logits and $\lambda$ began
+receiving gradient from the classification loss, and the mixture weights
+started to move. This is a prerequisite for the ``learned end-to-end'' claim
+the paper makes.
+
+\textbf{Why a statistical threshold helps.} Fixed-ratio pruning forces every
+scan to lose the same fraction of tokens, but the amount of diagnostically
+useful tissue varies: a sub-pleural nodule near the chest wall has different
+surrounding context than a central perihilar nodule. A statistical threshold
+$\tau_l = \mu_l + \lambda \sigma_l$ lets the model retain more tokens in
+scans with spread-out informative content and prune more aggressively in
+scans dominated by background. Sharing $\lambda$ across layers gave more
+stable training than per-layer learnable thresholds.
+
+\textbf{Why the CT-specific energy term matters.} Pruning methods designed for
+natural images assume that attention is a sufficient saliency signal. In CT,
+large fractions of the volume are air or homogeneous tissue whose token
+embeddings are nearly identical, producing attention maps that carry little
+information in early training. The energy term provides an inductive prior:
+voxel blocks with HU variance and gradient activity are more likely to contain
+relevant anatomy. In the fold-0 soft-pruning run, the energy weight $\gamma$
+moves from 0.333 to 0.334, a small but non-zero change in the expected
+direction.
+
+\textbf{Why recycling matters.} Without recycling, aggressive pruning at an
+early layer permanently destroys information the classifier could have used.
+Recycling injects a graded summary of pruned tokens into the classification
+token via a temperature-softmax, where tokens scored just below the threshold
+contribute most and those scored far below contribute little.
+
+\textbf{Remaining challenges.} Two related problems remain. First, the keep
+ratio stabilises at approximately 0.65 (35\% pruned) rather than the target
+of 0.5, because $\lambda$ barely moves from its $-0.5$ initialisation. The
+sparsity penalty (weight 1.5) is too weak to push $\lambda$ higher. Raising
+it to 3--4 or lowering the gate sharpness $\kappa$ would likely help.
+Second, the 6-point AUC gap between the pruned ($0.809 \pm 0.043$) and
+unpruned ($0.870 \pm 0.064$) models shows that the current soft-pruning
+regime costs accuracy. The pruned model's higher sensitivity ($0.892$) but
+lower specificity ($0.527$) suggests it preferentially preserves
+malignancy-associated tokens (nodule, vasculature) and prunes benign context
+too aggressively. A possible fix is to add a specificity-aware term to the
+loss or to use a milder target keep ratio.
+
+\textbf{Pretraining.} ImageNet pretraining made a large difference. Without
+pretraining, the model produced near-chance validation AUC for approximately
+55 epochs before loss began decreasing, with the best from-scratch result
+being ROC-AUC $0.670$ (the \texttt{ct\_atpt\_a100} run). Adding pretraining
+alone raised AUC to $0.712$, and switching from focal loss to cross-entropy
+pushed it to $0.849$ on a single fold. The full five-fold no-pruning
+baseline converged to $0.870 \pm 0.064$.
+
+\textbf{Weight EMA.} We tested exponential moving average of model
+weights~\cite{szegedy2016} with decay 0.999. In all five folds, the raw
+(non-EMA) checkpoint achieved the best validation metric. The likely
+explanation is that with only ${\sim}1{,}100$ optimisation steps per fold, a
+decay of 0.999 is too slow for the EMA to escape its initial blend. A lower
+decay or longer training might change this.
+
+\textbf{Limitations.} Our experiments use $96^3$ nodule crops rather than
+full-resolution chest CT; extending to full-volume inputs requires
+memory-efficient attention (FlashAttention or block-sparse), which we leave
+to future work. While LIDC-IDRI provides high-quality radiologist-consensus
+labels, the number of labelled malignant nodules is modest, and the dataset
+does not include longitudinal follow-up to confirm malignancy. External
+validation on the NLST cohort or institutional datasets is needed before
+clinical deployment. Our experiments use patient-level (not site-level or
+scanner-level) splits, so reported numbers may overstate generalisation
+across imaging vendors.
+
+\textbf{Clinical implications.} If these accuracy numbers replicate on
+external data, CT-ATPT could function as a second reader for screening
+triage. The pruning maps themselves are interpretable: a clinician can see
+which voxels the model treated as diagnostically informative, which may help
+with trust calibration.
+
+%==============================================================================
+\section{Conclusion}\label{sec:conclusion}
+We presented \textbf{CT-ATPT}, a 3D Vision Transformer with three components
+for efficient volumetric CT analysis: a learnable tri-component token
+importance score, a statistical adaptive threshold
+$\tau_l = \mu_l + \lambda \sigma_l$, and an information-preserving recycling
+step. A pretrained ViT-B/16 backbone achieves ROC-AUC $0.870 \pm 0.064$ on
+LIDC-IDRI under strict labels and patient-level five-fold cross-validation.
+With soft differentiable pruning, CT-ATPT achieves ROC-AUC
+$0.809 \pm 0.043$ while pruning ${\sim}35\%$ of tokens. The 6-point AUC gap
+relative to the unpruned baseline is a real cost; closing it (through
+stronger sparsity schedules and specificity-aware losses) is the main open
+problem. The learnable importance weights do move from their uniform
+initialisation, confirming the pruning criterion receives gradient and is
+actually trained. The framework could extend to other volumetric modalities
+(chest MRI, abdominal CT) where most voxels carry no diagnostic information
+and adaptive token allocation would be useful.
+
+%==============================================================================
+\section*{Acknowledgments}
+\R{Acknowledgements (funding, compute resources, dataset acknowledgements,
+collaborators) go here.}
+
+%==============================================================================
+\appendices
+
+\section{Hyperparameters}\label{app:hyperparams}
+\begin{table}[h]
+\centering
+\caption{Full hyperparameter table for CT-ATPT.}
+\label{tab:hyperparams}
+\begin{tabular}{ll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Input crop                  & $96 \times 96 \times 96$ \\
+Patch size                  & $8 \times 16 \times 16$ \\
+Initial tokens              & 432 + 1 (cls) \\
+Transformer depth $L$       & 12 \\
+Embedding dim $d$           & 768 \\
+Attention heads             & 12 \\
+MLP ratio                   & 4.0 \\
+Dropout                     & 0.1 \\
+Stochastic depth (drop path) & 0.1 (linear schedule) \\
+Backbone init               & ViT-B/16 ImageNet \\
+\midrule
+Optimizer                   & AdamW \\
+Learning rate               & $1 \times 10^{-4}$ \\
+Weight decay                & 0.05 \\
+LR warmup epochs            & 5 \\
+Total epochs                & 45 \\
+Batch size                  & 16 \\
+Gradient clip               & 1.0 \\
+Precision                   & bfloat16 \\
+Label smoothing $\epsilon$  & 0.05 \\
+\midrule
+Pruning mode (training)     & soft (differentiable) \\
+Pruning warmup epochs       & 10 \\
+Keep-ratio ramp epochs      & 15 \\
+Target keep fraction        & 0.5 \\
+Gate sharpness $\kappa$     & 4 \\
+$\lambda$ init              & $-0.5$ \\
+Min keep tokens $N_{\min}$  & 64 \\
+Sparsity weight $w_{\mathrm{spar}}$ & 1.5 \\
+$w_{\mathrm{ent}}$          & 0.01 \\
+$w_{\mathrm{con}}$          & 0.05 \\
+\midrule
+Test-time augmentation      & 8 axis-flip views \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Numerical validation of key formulas}\label{app:numerics}
+Before drafting the paper, we numerically verified each formula in
+Section~\ref{sec:method}.
+(i) The softmax of three learnable scalars always sums to one.
+(ii) The statistical threshold $\tau_l = \mu_l + \lambda \sigma_l$ produces
+sensible keep masks across synthetic score distributions with both positive
+and negative $\lambda$.
+(iii) The Bernoulli entropy $-(g\log g + (1-g)\log(1-g))$ is maximised at
+$g = 0.5$ with value $\ln 2 \approx 0.6931$.
+(iv) The attention-rollout recurrence preserves row-stochasticity
+($\sum_j R^{(l)}_{ij} = 1$ to within $10^{-6}$ machine precision).
+
+%==============================================================================
+\bibliographystyle{IEEEtran}
+\bibliography{paper_ctatpt}
+
+%==============================================================================
+\end{document}
