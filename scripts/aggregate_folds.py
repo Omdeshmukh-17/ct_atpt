@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import pickle
 import statistics
 from pathlib import Path
 
@@ -54,11 +55,18 @@ def main() -> None:
     per_metric: dict[str, list[float]] = {k: [] for k in HEADLINE}
     print(f"{'fold':<28} {'roc_auc':>9} {'best_bal':>9} {'sens':>7} {'spec':>7} {'src':>4}")
     print("-" * 70)
+    loaded = 0
     for ckpt_path in ckpts:
         # weights_only=False: checkpoints store an args dict with pathlib.Path
         # objects, which the PyTorch>=2.6 safe loader rejects. These are our
         # own trusted checkpoints.
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        except (EOFError, RuntimeError, pickle.UnpicklingError) as exc:
+            print(f"{ckpt_path.parent.name:<28} (CORRUPT/truncated checkpoint — skipped: "
+                  f"{type(exc).__name__}; size={ckpt_path.stat().st_size} bytes — rerun this fold)")
+            continue
+        loaded += 1
         metrics = ckpt.get("metrics") or {}
         if not metrics:
             print(f"{ckpt_path.parent.name:<28} (no metrics saved — skipped)")
@@ -75,7 +83,7 @@ def main() -> None:
               f"{src:>4}")
 
     print("\n" + "=" * 70)
-    print(f"Cross-validation summary over {len(ckpts)} folds")
+    print(f"Cross-validation summary over {loaded} of {len(ckpts)} folds")
     print("=" * 70)
     for k in HEADLINE:
         vals = per_metric[k]

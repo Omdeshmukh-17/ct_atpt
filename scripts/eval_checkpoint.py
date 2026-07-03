@@ -76,6 +76,14 @@ def main() -> None:
         pruning_mode=saved_args.get("pruning_mode", "adaptive"),
         scale_kept_tokens=saved_args.get("scale_kept_tokens", False),
         pruning_warmup_epochs=saved_args.get("pruning_warmup_epochs", 20),
+        # Soft-mode fields: gate_sharpness is a plain float (not in the state
+        # dict) and prune_target_keep sets the eval-time lambda schedule, so
+        # omitting them silently evaluates soft checkpoints with wrong gates.
+        prune_target_keep=saved_args.get("prune_target_keep", 0.5),
+        prune_ramp_epochs=saved_args.get("prune_ramp_epochs", 15),
+        soft_lambda_init=saved_args.get("soft_lambda_init", -2.0),
+        gate_sharpness=saved_args.get("gate_sharpness", 10.0),
+        drop_path_rate=saved_args.get("drop_path", 0.0),
     )
     print(f"\nModel config: dim={config.embed_dim}, depth={config.depth}, "
           f"heads={config.num_heads}, patch={config.patch_size}")

@@ -148,10 +148,14 @@ class CTATPT(nn.Module):
 
     Batched implementation: supports any batch size.
 
-    Pruning is done via soft gating + attention masking:
+    Pruning is done via gating + attention masking:
       - All token positions stay in the tensor throughout (fixed shape).
       - Pruned positions are zeroed and masked from attention.
-      - Kept positions are scaled by a learned gate in (0, 1).
+      - Adaptive mode: hard token dropping at a few stage blocks (depth/4,
+        depth/2, 3*depth/4), per-sample keep count from tau = mu + lam*sigma
+        clamped to a band around a scheduled budget; kept tokens stay at full
+        strength and a straight-through gate carries gradient into the scores.
+      - Soft mode: every kept position is scaled by a learned gate in (0, 1).
       - Pruned token information is recycled into the CLS token before zeroing.
 
     This design allows standard batched operations (no variable-length sequences)
@@ -203,7 +207,10 @@ class CTATPT(nn.Module):
         ])
 
         self.importance_logits    = nn.Parameter(torch.zeros(3))        # alpha, beta, gamma
-        self.lambda_raw           = nn.Parameter(torch.tensor(1.0))     # "adaptive" mode (softplus, >=0)
+        # "adaptive" mode: learnable RESIDUAL on the scheduled lambda,
+        # bounded via tanh(.)*0.25. Init 0 => tau starts exactly on the
+        # budget schedule; the model fine-tunes the operating point from there.
+        self.lambda_raw           = nn.Parameter(torch.tensor(0.0))
         # "soft" mode threshold scalar: UNconstrained so tau can sit below the
         # mean (keep >50%). Init negative => starts keeping more tokens (gentle).
         self.soft_lambda_raw      = nn.Parameter(torch.tensor(float(config.soft_lambda_init)))
@@ -227,11 +234,53 @@ class CTATPT(nn.Module):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
+        # Adaptive mode prunes at a few stage blocks (EViT-style), not after
+        # every block: per-block compounding (tau >= mean kept <=50% of the
+        # remainder 12 times over) forced every sample into the min-keep
+        # fallback, freezing abg/lambda and collapsing AUC to 0.5.
+        d = config.depth
+        self._prune_stage_list: list[int] = sorted(
+            {d // 4, d // 2, (3 * d) // 4} if d >= 4 else {d - 1}
+        )
+        self._prune_stage_set: set[int] = set(self._prune_stage_list)
+
         self._current_epoch: int = 0
 
     def set_epoch(self, epoch: int) -> None:
         """Set current training epoch for pruning warmup scheduling."""
         self._current_epoch = epoch
+
+    def _soft_effective_lambda(self) -> torch.Tensor:
+        """Effective soft-mode threshold scalar: scheduled + learnable residual.
+
+        Walks lambda from lam_start (tau well below mean => keep ~all, gentle
+        onset) to lam_end (=> keep ~target) over the post-warmup ramp.
+        lam_end comes from keep = P(score > mu + lambda*sigma) under a ~normal
+        score distribution => lambda = ndtri(1 - keep).
+        """
+        warm = self.config.pruning_warmup_epochs
+        ramp = max(1, self.config.prune_ramp_epochs)
+        frac = min(1.0, max(0.0, (self._current_epoch - warm) / ramp))
+        lam_start = -2.0                                               # keep ~0.98 at onset
+        keep = min(max(float(self.config.prune_target_keep), 1e-4), 1.0 - 1e-4)
+        lam_end = float(torch.special.ndtri(torch.tensor(1.0 - keep)))
+        lam_sched = lam_start + frac * (lam_end - lam_start)
+        return lam_sched + torch.tanh(self.soft_lambda_raw) * 0.25     # small learnable residual
+
+    def _adaptive_effective_lambda(self) -> torch.Tensor:
+        """Effective adaptive-mode threshold scalar: scheduled + learnable residual.
+
+        lam_sched targets the per-stage keep fraction rho(epoch)^(1/num_stages)
+        via keep = P(score > mu + lam*sigma) => lam = ndtri(1 - keep).
+        """
+        warm = self.config.pruning_warmup_epochs
+        ramp = max(1, self.config.prune_ramp_epochs)
+        frac = min(1.0, max(0.0, (self._current_epoch - warm) / ramp))
+        rho  = 1.0 - frac * (1.0 - float(self.config.prune_target_keep))
+        num_stages = max(1, len(self._prune_stage_list))
+        stage_frac = min(max(rho ** (1.0 / num_stages), 1e-4), 1.0 - 1e-4)
+        lam_sched  = float(torch.special.ndtri(torch.tensor(1.0 - stage_frac)))
+        return lam_sched + torch.tanh(self.lambda_raw) * 0.25
 
     # ------------------------------------------------------------------
     # Per-block pruning (batched)
@@ -244,6 +293,7 @@ class CTATPT(nn.Module):
         rollout:      torch.Tensor,   # [B, T+1, T+1]
         patch_energy: torch.Tensor,   # [B, T]
         active_mask:  torch.Tensor,   # [B, T] bool — True = still active
+        block_idx:    int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         B = x.shape[0]
         T = self.num_tokens
@@ -261,7 +311,7 @@ class CTATPT(nn.Module):
                 "score_map": active_f,
                 "keep_ratio": active_f.sum(dim=1) / T,
                 "tau": torch.zeros(B, device=x.device),
-                "lambda": F.softplus(self.lambda_raw).detach(),
+                "lambda": self.lambda_raw.detach(),
                 "alpha_beta_gamma": torch.softmax(self.importance_logits, dim=0).detach(),
                 "fallback": torch.zeros(B, dtype=torch.bool, device=x.device),
                 "sparsity": zero,
@@ -287,6 +337,22 @@ class CTATPT(nn.Module):
         attn_aug = attn_aug / attn_aug.sum(dim=-1, keepdim=True).clamp_min(_dtype_eps(attn_aug.dtype))
         rollout = torch.bmm(attn_aug, rollout)   # [B, T+1, T+1]
 
+        # Rollout is updated at every block (so stage blocks see the full
+        # propagation history), but tokens are only pruned at stage blocks.
+        if block_idx not in self._prune_stage_set:
+            zero = x.sum() * 0.0
+            stats = {
+                "entropy": zero,
+                "score_map": active_f,
+                "keep_ratio": active_f.sum(dim=1) / T,
+                "tau": torch.zeros(B, device=x.device),
+                "lambda": self.lambda_raw.detach(),
+                "alpha_beta_gamma": torch.softmax(self.importance_logits, dim=0).detach(),
+                "fallback": torch.zeros(B, dtype=torch.bool, device=x.device),
+                "sparsity": zero,
+            }
+            return x, active_mask, rollout, stats
+
         # ── Importance scores ─────────────────────────────────────────
         # How much each patch token is attended to (average over all queries)
         attention_received = attn_mean[:, :, 1:].mean(dim=1)   # [B, T]
@@ -306,13 +372,34 @@ class CTATPT(nn.Module):
             + weights[2] * energy_score
         ).clamp(0.0, 1.0) * active_f   # [B, T]
 
+        # ── Scheduled network-level keep budget rho(epoch) ────────────
+        # rho ramps 1.0 -> prune_target_keep after warmup. Each stage clamps
+        # the per-sample keep count to a band around the CUMULATIVE budget
+        # track rho^(j/S) of the ORIGINAL T (j = stage rank, S = #stages) —
+        # anchoring on the absolute track means per-stage clamping cannot
+        # compound into budget drift (a relative band drifts by band^S).
+        warm = self.config.pruning_warmup_epochs
+        ramp = max(1, self.config.prune_ramp_epochs)
+        frac = min(1.0, max(0.0, (self._current_epoch - warm) / ramp))
+        rho  = 1.0 - frac * (1.0 - float(self.config.prune_target_keep))
+        num_stages = max(1, len(self._prune_stage_list))
+        stage_rank = self._prune_stage_list.index(block_idx) + 1
+        cum_target = (rho ** (stage_rank / num_stages)) * T
+
         # ── Per-sample adaptive threshold ─────────────────────────────
         n_active = active_f.sum(dim=1, keepdim=True).clamp_min(1.0)
         mean_s   = (scores * active_f).sum(dim=1, keepdim=True) / n_active
         var_s    = ((scores - mean_s).pow(2) * active_f).sum(dim=1, keepdim=True) / n_active
         std_s    = var_s.sqrt()
 
-        lam  = F.softplus(self.lambda_raw)
+        # Lambda is SCHEDULED to the stage budget with a small learnable
+        # residual (same recipe as soft-mode v4). A purely learnable lambda
+        # lost the tug-of-war against the classification loss (v5.1 run:
+        # lambda drifted AWAY from the budget, every sample stayed clamped at
+        # the band ceiling). Scheduling puts tau inside the band by
+        # construction; the residual and the score distribution's shape
+        # decide the per-sample counts within it.
+        lam  = self._adaptive_effective_lambda()
         tau  = mean_s + lam * std_s                               # [B, 1]
 
         gate = torch.sigmoid(self.gate_sharpness * (scores - tau)) * active_f  # [B, T]
@@ -327,11 +414,14 @@ class CTATPT(nn.Module):
         recycled   = torch.bmm(recycle_w.unsqueeze(1), token_x).squeeze(1)  # [B, D]
         cls_x      = x[:, :1, :] + recycled.unsqueeze(1)               # [B, 1, D]
 
-        # ── Keep / prune decision ─────────────────────────────────────
+        # ── Keep / prune decision: adaptive count within a budget band ──
+        # tau decides how many tokens THIS sample keeps (per-sample adaptivity:
+        # on heavy-tailed real score distributions the fraction above mu+lam*
+        # sigma varies with the sample's score concentration), and the count is
+        # clamped to +/-10% of the cumulative budget track so the schedule is
+        # honoured and the hard floors are preserved.
         keep_mask = (scores > tau) & active_mask                        # [B, T]
 
-        # Fallback: guarantee min_keep_tokens per sample, but never exceed
-        # the current number of active tokens for that sample.
         cfg_min_keep = min(
             max(self.config.min_keep_tokens, math.ceil(T * self.config.min_keep_ratio), 1),
             T,
@@ -339,27 +429,45 @@ class CTATPT(nn.Module):
         fallback = torch.zeros(B, dtype=torch.bool, device=x.device)
         for b in range(B):
             n_active_b = int(active_mask[b].sum().item())
-            per_block_floor = math.ceil(
-                n_active_b * (1.0 - self.config.max_prune_fraction_per_block)
+            floor_b = max(
+                cfg_min_keep,
+                math.ceil(n_active_b * (1.0 - self.config.max_prune_fraction_per_block)),
+                math.ceil(cum_target * 0.9),
             )
-            effective_min_keep = min(max(cfg_min_keep, per_block_floor), n_active_b)
-            if int(keep_mask[b].sum().item()) < effective_min_keep:
+            ceil_b = max(floor_b, math.floor(min(float(n_active_b), cum_target * 1.1)))
+            floor_b = min(floor_b, n_active_b)
+            k_b = int(keep_mask[b].sum().item())
+            k_clamped = min(max(k_b, floor_b), ceil_b, n_active_b)
+            if k_clamped != k_b:
                 s = scores[b].masked_fill(~active_mask[b], -1.0)
-                top_idx = torch.topk(s, k=effective_min_keep, largest=True).indices
+                top_idx = torch.topk(s, k=k_clamped, largest=True).indices
                 row = torch.zeros(T, dtype=torch.bool, device=x.device)
                 row[top_idx] = True
                 keep_mask[b] = row
                 fallback[b] = True
 
-        # Keep selected tokens at full strength by default. The soft gate is
-        # still used for recycling and entropy, but repeated gate scaling can
-        # starve the classifier when gates remain near 0.5 early in training.
-        keep_f = keep_mask.float().unsqueeze(-1)
+        # Kept tokens stay at FULL strength in the forward pass (hard dropping
+        # is plain token dropout to a pretrained ViT — no activation-scale
+        # shock), while a straight-through gate routes gradient into scores so
+        # alpha/beta/gamma and lambda actually learn.
+        keep_f = keep_mask.to(dtype=token_x.dtype).unsqueeze(-1)
         if self.config.scale_kept_tokens:
             kept_tokens = token_x * gate.unsqueeze(-1) * keep_f
         else:
-            kept_tokens = token_x * keep_f
+            g = gate.unsqueeze(-1)
+            kept_tokens = token_x * (keep_f + g - g.detach())
         x = torch.cat([cls_x, kept_tokens], dim=1)                     # [B, T+1, D]
+
+        # ── Budget-centring sparsity loss (differentiable, drives lambda) ──
+        # The hard count is clamped to the band, so the classification loss
+        # alone gives lambda no reason to move (smoke test: lambda stayed at
+        # init, every sample pinned at the band ceiling => zero adaptivity).
+        # Penalise the PRE-clamp soft keep fraction's distance from the
+        # cumulative track: tau learns to sit inside the band, the clamp goes
+        # quiet, and per-sample variation can express.
+        soft_keep_frac = (gate * active_f).sum(dim=1) / n_active.squeeze(1)   # [B]
+        target_frac    = (cum_target / n_active.squeeze(1)).clamp(max=1.0)    # [B]
+        sparsity       = (soft_keep_frac - target_frac).pow(2).mean()
 
         # ── Auxiliary outputs ─────────────────────────────────────────
         score_map = scores * keep_mask.float()                          # [B, T]
@@ -378,7 +486,7 @@ class CTATPT(nn.Module):
             "lambda":          lam.detach(),
             "alpha_beta_gamma": weights.detach(),
             "fallback":        fallback,                                    # [B] bool
-            "sparsity":        x.sum() * 0.0,                               # unused in adaptive mode
+            "sparsity":        sparsity,
         }
         return x, keep_mask, rollout, stats
 
@@ -425,10 +533,19 @@ class CTATPT(nn.Module):
             + weights[2] * energy_score
         ).clamp(0.0, 1.0)                                              # [B, T]
 
-        # ── Statistical threshold tau = mu + lambda*sigma (lambda free) ──
+        # ── Statistical threshold tau = mu + lambda*sigma, lambda SCHEDULED ──
+        # Keep v2's smooth, self-centring (mu + lambda*sigma) threshold: the
+        # quantile variant collapsed the pretrained backbone because it
+        # scale-shocked every activation the instant pruning turned on (at the
+        # min-score cut, the soft gate multiplies *all* tokens by ~0.5-0.8).
+        # Instead we *schedule lambda* from lam_start (tau well below mean =>
+        # keep ~all, gentle onset) to lam_end (=> keep ~target), walking the
+        # keep-ratio down smoothly with no onset shock. A small learnable
+        # residual lets the model fine-tune the operating point.
+        lam = self._soft_effective_lambda()
+
         mean_s = scores.mean(dim=1, keepdim=True)
         std_s  = scores.std(dim=1, keepdim=True, unbiased=False)
-        lam    = self.soft_lambda_raw                                  # unconstrained scalar
         tau    = mean_s + lam * std_s                                  # [B, 1]
         gate   = torch.sigmoid(self.gate_sharpness * (scores - tau))   # [B, T] in (0, 1)
 
@@ -444,13 +561,11 @@ class CTATPT(nn.Module):
         gated_tokens = token_x * gate.unsqueeze(-1)
         x = torch.cat([cls_x, gated_tokens], dim=1)                    # [B, T+1, D]
 
-        # ── Scheduled keep-ratio target rho(epoch) and sparsity loss ──
-        warm = self.config.pruning_warmup_epochs
-        ramp = max(1, self.config.prune_ramp_epochs)
-        frac = min(1.0, max(0.0, (self._current_epoch - warm) / ramp))
-        rho  = 1.0 - frac * (1.0 - self.config.prune_target_keep)      # 1.0 -> target_keep
+        # ── Retention-ratio regulariser (mild; lambda schedule does the work) ──
+        # One-sided: only penalise keeping MORE than the final target, so it
+        # nudges in the same direction as the schedule and never fights it.
         mean_keep = gate.mean()
-        sparsity  = torch.relu(mean_keep - rho)                        # penalise keeping > target
+        sparsity  = torch.relu(mean_keep - float(self.config.prune_target_keep))
 
         # Entropy regulariser (push gates toward decisive 0/1)
         eps = _dtype_eps(gate.dtype)
@@ -510,7 +625,7 @@ class CTATPT(nn.Module):
         sparsity_terms = []
         fallback_total = torch.zeros(1, device=volume.device)
 
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
             # key_padding_mask: True = ignore. CLS (pos 0) is never masked.
             kpm = torch.cat([
                 torch.zeros(B, 1, dtype=torch.bool, device=volume.device),
@@ -531,6 +646,7 @@ class CTATPT(nn.Module):
                 rollout=rollout,
                 patch_energy=patch_energy,
                 active_mask=active_mask,
+                block_idx=block_idx,
             )
             entropy_terms.append(stats["entropy"])
             score_maps.append(stats["score_map"])
@@ -560,11 +676,10 @@ class CTATPT(nn.Module):
         else:
             consistency = logits.sum() * 0.0
 
-        lambda_report = (
-            self.soft_lambda_raw.detach()
-            if self.config.pruning_mode == "soft"
-            else F.softplus(self.lambda_raw).detach()
-        )
+        if self.config.pruning_mode == "soft":
+            lambda_report = self._soft_effective_lambda().detach()
+        else:
+            lambda_report = self._adaptive_effective_lambda().detach()
         aux = {
             "det_pred":         det_pred,
             "grid_shape":       self.grid_shape,

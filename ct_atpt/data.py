@@ -12,16 +12,14 @@ from torch.utils.data import Dataset
 
 def _random_zoom_3d(
     volume: np.ndarray,
-    rng: random.Random,
-    scale_range: tuple[float, float] = (0.85, 1.15),
+    scale: float,
 ) -> np.ndarray:
-    """Isotropic random zoom via trilinear resampling, restored to original shape.
+    """Isotropic zoom via trilinear resampling, restored to original shape.
 
     Scales the whole volume by a single factor (mimics nodule-size / scanner-FOV
     variation), then center crops or pads back to the input shape so the tensor
     size is unchanged. Dependency-free (uses torch's interpolate).
     """
-    scale = rng.uniform(*scale_range)
     if abs(scale - 1.0) < 1e-3:
         return volume
 
@@ -44,8 +42,9 @@ def augment_volume(
 
     All transforms are label-preserving for nodule malignancy. Flips and 90°
     rotations are exact symmetries (no interpolation); zoom and intensity jitter
-    mimic scanner / acquisition variability. The nodule is centered in the crop,
-    so flips/rotations keep the (0.5, 0.5, 0.5) centroid invariant.
+    mimic scanner / acquisition variability. Every geometric transform updates
+    `det_values` accordingly, so detection targets stay valid even when the
+    nodule is not exactly centered in the crop.
 
     Args:
         volume: float32 array [Z, Y, X] normalized to [0, 1].
@@ -65,15 +64,27 @@ def augment_volume(
             if has_det:
                 det[coord_idx] = 1.0 - det[coord_idx]
 
-    # Random 90° rotation in the axial (Y, X) plane. A centered nodule's
-    # centroid (0.5, 0.5) is invariant under these rotations, so det is unchanged.
-    k = rng.randint(0, 3)
-    if k:
-        volume = np.rot90(volume, k=k, axes=(1, 2)).copy()
+    # Random 90° rotation in the axial (Y, X) plane. Requires a square Y/X
+    # crop (rot90 would otherwise change the tensor shape). One rotation maps
+    # normalized centroid (cy, cx) -> (1 - cx, cy); radius is unchanged.
+    if volume.shape[1] == volume.shape[2]:
+        k = rng.randint(0, 3)
+        if k:
+            volume = np.rot90(volume, k=k, axes=(1, 2)).copy()
+            if has_det:
+                for _ in range(k):
+                    det[1], det[2] = 1.0 - det[2], det[1]
 
-    # Random isotropic zoom (p=0.5) — restored to original shape.
+    # Random isotropic zoom (p=0.5) — restored to original shape. Center
+    # crop/pad means a point at normalized coord c moves to 0.5 + (c-0.5)*s,
+    # and the normalized radius scales by s.
     if rng.random() < 0.5:
-        volume = _random_zoom_3d(volume, rng)
+        scale = rng.uniform(0.85, 1.15)
+        volume = _random_zoom_3d(volume, scale)
+        if has_det:
+            for i in range(3):
+                det[i] = float(min(1.0, max(0.0, 0.5 + (det[i] - 0.5) * scale)))
+            det[3] = float(det[3] * scale)
 
     # Gaussian intensity noise (sigma ~ U[0, 0.02])
     if rng.random() < 0.7:

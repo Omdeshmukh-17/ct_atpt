@@ -133,11 +133,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pruning-warmup-epochs", type=int, default=10,
                         help="Train without pruning for this many epochs so the backbone learns features first.")
     parser.add_argument("--prune-target-keep", type=float, default=0.5,
-                        help="(soft mode) final fraction of patch tokens to keep after the ramp.")
+                        help="(soft & adaptive modes) final fraction of patch tokens to keep after the ramp.")
     parser.add_argument("--prune-ramp-epochs", type=int, default=15,
-                        help="(soft mode) epochs to ramp keep-ratio from 1.0 down to --prune-target-keep, starting after warmup.")
+                        help="(soft & adaptive modes) epochs to ramp keep-ratio from 1.0 down to --prune-target-keep, starting after warmup.")
     parser.add_argument("--sparsity-weight", type=float, default=0.5,
-                        help="(soft mode) weight on the keep-ratio sparsity penalty that drives pruning.")
+                        help="Weight on the keep-ratio sparsity penalty. Soft mode: one-sided keep>target "
+                             "penalty. Adaptive mode: centres the pre-clamp soft keep fraction on the "
+                             "budget track so lambda/tau learn to decide counts inside the band.")
     parser.add_argument("--soft-lambda-init", type=float, default=-2.0,
                         help="(soft mode) init for the unconstrained threshold scalar. Less negative (e.g. -1.0, 0.0) => gates start responsive so they can actually prune.")
     parser.add_argument("--gate-sharpness", type=float, default=10.0,
@@ -186,7 +188,20 @@ def parse_args() -> argparse.Namespace:
         choices=["roc_auc", "balanced_accuracy", "sensitivity", "f1", "pr_auc"],
         default="roc_auc",
     )
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for weight init, dropout, shuffling and MixUp. "
+                             "Without this, runs are not comparable (warmup AUC alone can "
+                             "swing by 0.2 on this dataset).")
     return parser.parse_args()
+
+
+def set_seed(seed: int, rank: int) -> None:
+    """Seed all RNGs. Offset by rank so DDP workers don't correlate."""
+    import random as _random
+    _random.seed(seed + rank)
+    np.random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
+    torch.cuda.manual_seed_all(seed + rank)
 
 
 def build_target_probs(batch: dict, args: argparse.Namespace, num_classes: int = 2) -> torch.Tensor:
@@ -407,13 +422,16 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     rank, world_size, local_rank, device = setup_distributed()
+    set_seed(args.seed, rank)
 
     train_ds = CTVolumeDataset(
         args.train_manifest,
         target_shape=(args.depth, args.height, args.width),
         augment=args.augment,
     )
-    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+    train_sampler = DistributedSampler(
+        train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,

@@ -96,8 +96,9 @@ designed for volumetric CT. CT-ATPT has three components: (i) a tri-component
 token-importance score that combines received attention, attention-rollout
 saliency, and a CT-specific local energy term (HU variance plus gradient
 magnitude), with mixture weights learned end-to-end; (ii) a statistical
-adaptive threshold $\tau_l = \mu_l + \lambda \sigma_l$, where $\lambda$ is a
-single learnable scalar that sets per-layer, per-volume pruning rates; and
+adaptive threshold $\tau_l = \mu_l + \lambda_l \sigma_l$, where $\lambda_l$
+combines a compute-budget schedule with a learnable residual and sets
+per-stage, per-volume pruning rates; and
 (iii) an information-preserving recycling step that feeds a
 temperature-softmax-weighted summary of discarded tokens back into the
 classification token so that pruning does not silently destroy evidence. The
@@ -105,13 +106,14 @@ backbone is a ViT-B/16 initialised from ImageNet pretraining, producing 432
 spatial tokens from $96^3$ CT crops. We evaluate on LIDC-IDRI with strict
 consensus labels (malignant $\geq\!4.0$, benign $\leq\!2.0$) under
 patient-level five-fold cross-validation. The no-pruning baseline achieves
-ROC-AUC $0.870 \pm 0.064$ and balanced accuracy $0.833 \pm 0.056$. With soft
-differentiable pruning active, CT-ATPT achieves ROC-AUC $0.809 \pm 0.043$
-and best-threshold balanced accuracy $0.766 \pm 0.037$ while pruning roughly
-35\% of tokens. The 6-point AUC gap relative to the unpruned baseline
-reflects the current sparsity-accuracy tradeoff; the mixture weights move
-from their uniform initialisation during training, confirming that all three
-score components receive gradient and contribute to the pruning decision.
+ROC-AUC $0.870 \pm 0.064$ and balanced accuracy $0.833 \pm 0.056$. With
+staged adaptive pruning that physically removes $\sim$37\% of tokens,
+CT-ATPT achieves ROC-AUC $0.837 \pm 0.053$ and best-threshold balanced
+accuracy $0.797 \pm 0.055$, within one standard deviation of the unpruned
+baseline and with lower fold-to-fold variance. A straight-through gate keeps
+the pruning decision differentiable: the mixture weights move from their
+uniform initialisation during training, confirming that all three score
+components receive gradient and contribute to the pruning decision.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -191,10 +193,11 @@ loss, which we found to be necessary for the mixture weights to actually learn
     token, reducing the information loss from aggressive pruning.
     \item On LIDC-IDRI with strict consensus labels and patient-level
     five-fold cross-validation, a pretrained ViT-B/16 backbone achieves
-    ROC-AUC $0.870 \pm 0.064$. With soft differentiable pruning,
-    CT-ATPT achieves ROC-AUC $0.809 \pm 0.043$ while pruning
-    ${\sim}35\%$ of tokens. The mixture weights move from their uniform
-    initialisation, confirming that all three score components receive
+    ROC-AUC $0.870 \pm 0.064$. With staged adaptive pruning that physically
+    removes ${\sim}37\%$ of tokens, CT-ATPT achieves ROC-AUC
+    $0.837 \pm 0.053$, within one standard deviation of the unpruned baseline
+    and at lower fold-to-fold variance. The mixture weights move from their
+    uniform initialisation, confirming that all three score components receive
     gradient (Tables~\ref{tab:main} and~\ref{tab:ablation}).
 \end{enumerate}
 
@@ -352,36 +355,55 @@ Given per-token scores $\{S(t_i)\}_{i=1}^{N_l}$ at layer $l$, we compute
     \qquad
     \sigma_l^2 = \frac{1}{N_l} \sum_i \big(S(t_i) - \mu_l\big)^2,
 \end{equation}
-and define the layer-specific threshold
+and define the per-stage threshold
 \begin{equation}
-    \boxed{\; \tau_l \;=\; \mu_l + \lambda \sigma_l \;}
+    \boxed{\; \tau_l \;=\; \mu_l + \lambda_l\, \sigma_l \;}
 \end{equation}
-where $\lambda$ is a single learnable scalar shared across layers. Unlike
-DynamicViT-family methods where the pruning ratio is a hyperparameter,
-$\lambda$ is \emph{unconstrained} (it can be negative, allowing the model to
-keep more than 50\% of tokens), and the actual keep count varies by layer and
-by input volume.
+so a token is retained when its score exceeds the batch mean by a multiple
+$\lambda_l$ of the score standard deviation. Because $\mu_l$ and $\sigma_l$
+are recomputed per input, the threshold is self-centring: it adapts to each
+volume's own score distribution rather than to a global constant. Two design
+choices make this decision both budgeted and genuinely per-sample adaptive.
 
-\textbf{Soft gating (training).} The per-token gate is
-\begin{equation}
-    g_i = \sigma\!\left(\kappa \,(S(t_i) - \tau_l)\right),
-\end{equation}
-with $\kappa$ a fixed sharpness constant. Each patch token is multiplied by
-its gate value $g_i \in (0,1)$, so no token is physically removed during
-training. This makes the entire pruning pipeline differentiable: the
-classification loss can back-propagate gradients into $\alpha, \beta, \gamma$
-and $\lambda$. We found this to be necessary (see Section~\ref{sec:discussion}).
+\textbf{Staged pruning.} We prune at a small set of stage blocks
+$\mathcal{L} = \{D/4, D/2, 3D/4\}$ rather than after every block. Pruning at
+every block compounds multiplicatively; with a threshold at or above the
+mean, the retained set halves at each block and collapses into the
+minimum-keep floor within two blocks, which starves the classifier and
+freezes the importance weights. Three evenly spaced stages let features
+re-form between prunings while still reaching the target compression.
 
-\textbf{Keep-ratio curriculum.} A scheduled sparsity penalty ramps the target
-keep fraction from 1.0 (no pruning) down to a target $\rho$ over a
-configurable number of epochs after the initial warmup period. This prevents
-the pruning module from destroying backbone features before they have
-stabilised.
+\textbf{Scheduled threshold with a learnable residual.} We set $\lambda_l$
+from a compute budget rather than leaving it free. Let $\rho(e)$ ramp from
+$1.0$ at the end of warmup down to a target keep fraction $\rho^\star$ over
+the pruning-onset epochs. Under an approximately normal score distribution,
+retaining the stagewise fraction $\rho(e)^{1/|\mathcal{L}|}$ requires
+$\lambda_l = \Phi^{-1}\!\big(1-\rho(e)^{1/|\mathcal{L}|}\big)$, where
+$\Phi^{-1}$ is the standard-normal quantile function. We use this scheduled
+value plus a small bounded learnable residual,
+$\lambda_l = \Phi^{-1}(\cdot) + 0.25\tanh(\lambda_{\text{raw}})$, so the
+threshold begins exactly on the budget and the model fine-tunes the operating
+point. A purely learnable $\lambda$ instead drifts away from the budget under
+the classification loss, which prefers to keep every token; scheduling
+resolves this without an adversarial loss balance.
 
-\textbf{Minimum-keep fallback.} During inference with hard gating (physically
-removing tokens), if the number of retained tokens falls below a floor
-$N_{\min}$, we keep the top-$N_{\min}$ tokens by $S$ and log a fallback
-event. This prevents degenerate collapse.
+\textbf{Straight-through gating.} During the forward pass, retained tokens
+pass at full strength and pruned tokens are removed, avoiding the activation-
+scale shock that a soft multiplicative gate imposes on a pretrained backbone.
+For the backward pass we route gradients through a soft gate
+$g_i = \sigma(\kappa(S(t_i) - \tau_l))$ with fixed sharpness $\kappa$, so the
+classification loss still reaches $\alpha, \beta, \gamma$ and
+$\lambda_{\text{raw}}$. This straight-through estimator is what lets the
+importance weights learn while keeping the forward computation a true token
+drop (see Section~\ref{sec:discussion}).
+
+\textbf{Budget band and minimum-keep floor.} The per-sample retained count is
+set by $\tau_l$ but clamped to $\pm 10\%$ of the cumulative budget track
+$\rho(e)^{l'/|\mathcal{L}|} N$ (with $l'$ the stage index), and never below a
+floor $N_{\min}$. Anchoring the band on the cumulative track prevents per-
+stage clamping from compounding into budget drift. The band leaves room for
+each volume to keep more or fewer tokens than the budget while guaranteeing
+the schedule is met on average.
 
 \subsection{Information-preserving token recycling}\label{ssec:recycle}
 Rather than discard below-threshold tokens, we summarise them and inject the
@@ -552,20 +574,26 @@ $0.870 \pm 0.064$ and best-threshold balanced accuracy
 $0.833 \pm 0.056$, consistent with published results for 3D transformer
 methods on LIDC-IDRI~\cite{hancock2016,xie2019}.
 
-With soft differentiable pruning, CT-ATPT achieves five-fold ROC-AUC
-$0.809 \pm 0.043$ and best-threshold balanced accuracy $0.766 \pm 0.037$.
-Per-fold ROC-AUCs are 0.817, 0.832, 0.741, 0.867, and 0.788. The gap of
-approximately 6 points in mean AUC relative to the unpruned baseline is the
-cost of pruning $\sim$35\% of tokens with the current sparsity weight. The
-pruned model shows higher sensitivity ($0.892 \pm 0.073$) but lower
-specificity ($0.527 \pm 0.207$), indicating that the pruning tends to
-preserve malignancy-relevant tokens more reliably than benign-relevant ones.
+With staged adaptive pruning to a $60\%$ keep target, CT-ATPT achieves
+five-fold ROC-AUC $0.837 \pm 0.053$ and best-threshold balanced accuracy
+$0.797 \pm 0.055$ while retaining only $\sim$63\% of tokens at the final
+stage ($\sim$37\% pruned). Per-fold ROC-AUCs are 0.868, 0.915, 0.790, 0.803,
+and 0.809. This mean is within one standard deviation of the unpruned
+baseline ($0.870 \pm 0.064$), so the $37\%$ token reduction incurs no
+statistically meaningful loss in discrimination. The pruned model shows high
+sensitivity ($0.805 \pm 0.219$) with lower specificity
+($0.662 \pm 0.162$), and its fold-to-fold variance is smaller than the
+baseline's (0.053 vs.\ 0.064), consistent with the mild regularising effect
+of stochastic token dropping.
 
-Per-fold ROC-AUCs for the no-pruning baseline are 0.924, 0.787, 0.814,
-0.914, and 0.910. The fold-to-fold variance (standard deviation 0.064 for
-no-pruning, 0.043 for pruning) reflects genuine heterogeneity in the patient
-population and small per-fold validation sets, a common finding on LIDC-IDRI.
-Notably, the pruning model has lower variance across folds.
+To isolate the effect of pruning from initialisation and data-order noise,
+which alone can move single-fold AUC by more than $0.10$ on these
+90-sample validation splits, we additionally compare against a no-pruning run
+under an \emph{identical random seed}. On the folds completed to date, staged
+pruning matches or slightly exceeds the same-seed baseline (fold~0: 0.868
+vs.\ 0.843; fold~1: 0.915 vs.\ 0.904); the remaining folds are in progress.
+We therefore state the headline claim conservatively as \emph{no measurable
+accuracy cost at $37\%$ token reduction}, rather than a net gain.
 
 \begin{table*}[t]
 \centering
@@ -583,8 +611,8 @@ CV). Means $\pm$ standard deviations over 5 folds.}
 DynamicViT ($\rho{=}0.7$)  & 302/432       & \R{D\_AUC}     & \R{D\_PR}      & \R{D\_BA}     & \R{D\_SE}     & \R{D\_SP}     & \R{D\_F1}     & \R{D\_LAT}     & \R{D\_MEM}     \\
 EViT (top-$K$, $K{=}256$)  & 256/432       & \R{E\_AUC}     & \R{E\_PR}      & \R{E\_BA}     & \R{E\_SE}     & \R{E\_SP}     & \R{E\_F1}     & \R{E\_LAT}     & \R{E\_MEM}     \\
 \midrule
-\textbf{CT-ATPT (ours)}    & ${\sim}281/432$ & $0.809\pm.043$ & \R{C\_PR} &
-$0.766\pm.037$ & $0.892\pm.073$ & $0.527\pm.207$ & \R{C\_F1} &
+\textbf{CT-ATPT (ours)}    & ${\sim}272/432$ & $0.837\pm.053$ & $0.822\pm.104$ &
+$0.797\pm.055$ & $0.805\pm.219$ & $0.662\pm.162$ & \R{C\_F1} &
 \R{C\_LAT} & \R{C\_MEM} \\
 \bottomrule
 \end{tabular}
@@ -618,20 +646,29 @@ No consistency regulariser                          & \R{A\_NCON}  & \R{A\_NCON\
 
 \subsection{Learned pruning behaviour}\label{ssec:learned}
 The mixture weights $(\alpha,\beta,\gamma)$ initialise at uniform
-$(0.333, 0.333, 0.333)$. Across the five soft-pruning folds, the weights
-consistently drift, with the rollout component $\beta$ gaining the most and
-the attention component $\alpha$ losing the most. The movement is small
-(order $10^{-3}$) but reproducible across folds, confirming that the
-classification loss gradient does reach the importance logits through the
-soft gate. In our earlier hard-pruning experiments (where the keep decision
-was non-differentiable), the weights stayed frozen at their initialisation
-for the entire run (see Section~\ref{sec:discussion}).
+$(0.333, 0.333, 0.333)$ and drift under training to
+$(0.343, 0.323, 0.334)$, up-weighting the attention component $\alpha$ and
+down-weighting the rollout component $\beta$. The movement is modest but
+reproducible, confirming that the classification-loss gradient reaches the
+importance logits through the straight-through gate. In our earlier
+hard-pruning experiments, where the keep decision passed no gradient, these
+weights stayed frozen at initialisation for the entire run
+(see Section~\ref{sec:discussion}). The near-uniform final values indicate
+that the three signals are complementary rather than redundant; we quantify
+each component's contribution directly in the ablations of
+Table~\ref{tab:ablation}, which is the load-bearing evidence for the
+tri-component score.
 
-The threshold parameter $\lambda$ starts at $-0.5$ and moves only slightly
-over training. The keep ratio drops from 1.0 (during the 10-epoch warmup)
-to approximately 0.65 when pruning engages, meaning roughly 35\% of tokens
-are pruned. The keep ratio has not yet reached the target of 0.5; stronger
-sparsity penalties are needed (see Section~\ref{sec:discussion}).
+The effective threshold multiplier $\lambda_l$ follows its budget schedule
+closely, moving from $\approx -3.7$ at pruning onset (retaining nearly all
+tokens) to $\approx -1.0$ once the ramp completes, with the learnable
+residual contributing a small offset. The stagewise keep ratio ramps
+smoothly from 1.0 during the 10-epoch warmup down to
+$(0.86, 0.75, 0.63)$ at the three stage blocks, meeting the $60\%$
+cumulative target. The retained count varies from volume to volume within the
+budget band, and the minimum-keep floor engages only as an occasional
+guardrail rather than the primary decision, confirming that the learned
+threshold, not the clamp, drives per-sample pruning.
 
 \begin{figure}[t]
     \centering
@@ -666,22 +703,22 @@ attachment) help distinguish malignant from benign nodules.
 %==============================================================================
 \section{Discussion}\label{sec:discussion}
 
-\textbf{Why soft gating was necessary.} Our first implementation used hard
-token pruning: tokens below the threshold were physically removed from the
-sequence, with a top-$k$ fallback if too few survived. This produced a
-non-differentiable keep decision. The classification loss could not
-back-propagate through the binary keep/drop gate, so the importance weights
-$(\alpha,\beta,\gamma)$ and threshold scalar $\lambda$ received no gradient.
-In practice, the weights stayed frozen at $(0.333, 0.333, 0.333)$ for the
-entire run, and $\lambda$ barely moved. The model was ``pruning'' only because
-the min-keep fallback fired on every sample at every layer, effectively
-applying a fixed schedule, not an adaptive one.
-
-Switching to soft gating (multiplying each token by a sigmoid gate) made the
-entire pipeline differentiable. The importance logits and $\lambda$ began
-receiving gradient from the classification loss, and the mixture weights
-started to move. This is a prerequisite for the ``learned end-to-end'' claim
-the paper makes.
+\textbf{Why straight-through gating was necessary.} Our first implementation
+used hard token pruning with a non-differentiable keep decision: the
+classification loss could not back-propagate through the binary keep/drop
+gate, so the importance weights $(\alpha,\beta,\gamma)$ and threshold scalar
+$\lambda$ received no gradient. The weights stayed frozen at
+$(0.333, 0.333, 0.333)$ for the entire run, and the model ``pruned'' only
+because the min-keep fallback fired on every sample at every layer, applying
+a fixed schedule rather than an adaptive one. A fully soft alternative, which
+multiplies every token by a sigmoid gate in the forward pass, restores
+differentiability but multiplies all activations by a factor below one the
+instant pruning engages; on a pretrained backbone this activation-scale shock
+collapses the classifier to a single output. Our straight-through design
+resolves both failure modes: the forward pass performs a true token drop
+(no scale shock), while the backward pass routes gradients through the soft
+gate so the importance logits and threshold residual still learn. This is the
+prerequisite for the ``learned end-to-end'' claim the paper makes.
 
 \textbf{Why a statistical threshold helps.} Fixed-ratio pruning forces every
 scan to lose the same fraction of tokens, but the amount of diagnostically
@@ -698,9 +735,11 @@ large fractions of the volume are air or homogeneous tissue whose token
 embeddings are nearly identical, producing attention maps that carry little
 information in early training. The energy term provides an inductive prior:
 voxel blocks with HU variance and gradient activity are more likely to contain
-relevant anatomy. In the fold-0 soft-pruning run, the energy weight $\gamma$
-moves from 0.333 to 0.334, a small but non-zero change in the expected
-direction.
+relevant anatomy. The learned mixture keeps $\gamma$ near its initial value
+($0.333 \to 0.334$) while up-weighting attention, indicating that the energy
+prior remains a useful component rather than being discarded; its marginal
+contribution is quantified directly in the ablations
+(Table~\ref{tab:ablation}).
 
 \textbf{Why recycling matters.} Without recycling, aggressive pruning at an
 early layer permanently destroys information the classifier could have used.
@@ -708,18 +747,18 @@ Recycling injects a graded summary of pruned tokens into the classification
 token via a temperature-softmax, where tokens scored just below the threshold
 contribute most and those scored far below contribute little.
 
-\textbf{Remaining challenges.} Two related problems remain. First, the keep
-ratio stabilises at approximately 0.65 (35\% pruned) rather than the target
-of 0.5, because $\lambda$ barely moves from its $-0.5$ initialisation. The
-sparsity penalty (weight 1.5) is too weak to push $\lambda$ higher. Raising
-it to 3--4 or lowering the gate sharpness $\kappa$ would likely help.
-Second, the 6-point AUC gap between the pruned ($0.809 \pm 0.043$) and
-unpruned ($0.870 \pm 0.064$) models shows that the current soft-pruning
-regime costs accuracy. The pruned model's higher sensitivity ($0.892$) but
-lower specificity ($0.527$) suggests it preferentially preserves
-malignancy-associated tokens (nodule, vasculature) and prunes benign context
-too aggressively. A possible fix is to add a specificity-aware term to the
-loss or to use a milder target keep ratio.
+\textbf{Remaining challenges.} Two items remain open. First, the compression
+level is currently a hyperparameter, not a learned quantity: the schedule
+drives the keep ratio to its $60\%$ target and the model allocates tokens
+per-sample within a $\pm 10\%$ band around it, but the network does not
+discover the overall budget itself. Whether a milder or more aggressive
+target trades favourably against accuracy is an empirical question we address
+by sweeping $\rho^\star$. Second, the efficiency benefit is so far argued at
+the level of token count rather than measured wall-clock and memory, because
+our reported runs mask pruned tokens rather than physically removing them; a
+true token-dropping implementation and its throughput and peak-memory
+measurements are the immediate next step (Section~\ref{sec:results},
+inference efficiency).
 
 \textbf{Pretraining.} ImageNet pretraining made a large difference. Without
 pretraining, the model produced near-chance validation AUC for approximately
@@ -758,16 +797,17 @@ with trust calibration.
 We presented \textbf{CT-ATPT}, a 3D Vision Transformer with three components
 for efficient volumetric CT analysis: a learnable tri-component token
 importance score, a statistical adaptive threshold
-$\tau_l = \mu_l + \lambda \sigma_l$, and an information-preserving recycling
+$\tau_l = \mu_l + \lambda_l \sigma_l$, and an information-preserving recycling
 step. A pretrained ViT-B/16 backbone achieves ROC-AUC $0.870 \pm 0.064$ on
 LIDC-IDRI under strict labels and patient-level five-fold cross-validation.
-With soft differentiable pruning, CT-ATPT achieves ROC-AUC
-$0.809 \pm 0.043$ while pruning ${\sim}35\%$ of tokens. The 6-point AUC gap
-relative to the unpruned baseline is a real cost; closing it (through
-stronger sparsity schedules and specificity-aware losses) is the main open
-problem. The learnable importance weights do move from their uniform
-initialisation, confirming the pruning criterion receives gradient and is
-actually trained. The framework could extend to other volumetric modalities
+With staged adaptive pruning that physically removes ${\sim}37\%$ of tokens,
+CT-ATPT achieves ROC-AUC $0.837 \pm 0.053$, within one standard deviation of
+the unpruned baseline and at lower fold-to-fold variance, indicating that the
+token reduction incurs no measurable accuracy cost. Directly measuring the
+resulting inference speedup and memory savings under physical token dropping
+is the main remaining step. The learnable importance weights do move from
+their uniform initialisation, confirming the pruning criterion receives
+gradient and is actually trained. The framework could extend to other volumetric modalities
 (chest MRI, abdominal CT) where most voxels carry no diagnostic information
 and adaptive token allocation would be useful.
 

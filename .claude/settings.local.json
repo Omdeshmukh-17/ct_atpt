@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -m py_compile ct_atpt/data.py scripts/train_ct_atpt_ddp.py scripts/ensemble_eval.py)"
-    ]
-  }
-}
