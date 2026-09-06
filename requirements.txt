@@ -12,3 +12,5 @@ torchvision
 numpy
 pandas
 scikit-learn
+pylidc
+matplotlib

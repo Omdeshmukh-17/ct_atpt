@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+runs/
+results/
+splits_tvt/
+*.npy
+.pylidc.conf
