@@ -23,6 +23,7 @@ from ct_atpt.inference import tta_average_proba
 from ct_atpt.losses import detection_loss, focal_loss
 from ct_atpt.metrics import BinaryMetrics, compute_binary_metrics, format_binary_metrics
 from ct_atpt.model import CTATPT, CTATPTConfig
+from ct_atpt.phyadam import PhyAdam
 from scripts.load_pretrained import load_imagenet_vit_into_ctatpt
 
 
@@ -152,6 +153,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--optimizer", choices=["adamw", "phyadam"], default="adamw",
+                        help="Optimizer to use")
+    parser.add_argument("--base-mass", type=float, default=1.0,
+                        help="PhyAdam: base particle mass M0")
+    parser.add_argument("--mass-scale", type=float, default=0.1,
+                        help="PhyAdam: mass scaling coefficient alpha")
+    parser.add_argument("--friction", type=float, default=0.1,
+                        help="PhyAdam: friction coefficient mu")
     parser.add_argument("--prune-lr-mult", type=float, default=1.0,
                         help="LR multiplier for the pruning scalars (importance_logits/α,β,γ, "
                              "soft_lambda_raw, lambda_raw, temperature_raw). These also get "
@@ -511,16 +520,29 @@ def main() -> None:
     }
     prune_params = [p for p in model.parameters() if id(p) in prune_param_ids]
     other_params = [p for p in model.parameters() if id(p) not in prune_param_ids]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": other_params, "weight_decay": args.weight_decay, "lr": args.lr},
-            {"params": prune_params, "weight_decay": 0.0, "lr": args.lr * args.prune_lr_mult},
-        ],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    if args.optimizer == "phyadam":
+        optimizer = PhyAdam(
+            [
+                {"params": other_params, "weight_decay": args.weight_decay, "lr": args.lr},
+                {"params": prune_params, "weight_decay": 0.0, "lr": args.lr * args.prune_lr_mult},
+            ],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            base_mass=args.base_mass,
+            mass_scale=args.mass_scale,
+            friction=args.friction,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": other_params, "weight_decay": args.weight_decay, "lr": args.lr},
+                {"params": prune_params, "weight_decay": 0.0, "lr": args.lr * args.prune_lr_mult},
+            ],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
     if is_main_process(rank):
-        print(f"Optimizer: {len(other_params)} backbone params @ lr={args.lr:.2e} (wd={args.weight_decay}) | "
+        print(f"Optimizer: {args.optimizer.upper()} | {len(other_params)} backbone params @ lr={args.lr:.2e} (wd={args.weight_decay}) | "
               f"{len(prune_params)} pruning scalars @ lr={args.lr * args.prune_lr_mult:.2e} (wd=0)")
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp == "fp16" and device.type == "cuda")
     if args.amp != "fp16":

@@ -41,6 +41,7 @@ CSV_PATH = RESULTS_DIR / "all_prune_metrics.csv"
 PLOTS_DIR = RESULTS_DIR / "plots"
 
 CSV_FIELDS = [
+    "optimizer",
     "prune_percent",
     "checkpoint",
     "manifest",
@@ -70,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-manifest", type=Path, required=True)
     p.add_argument("--prune-percent", type=float, required=True,
                    help="Pruning percentage this checkpoint was trained for (e.g. 10, 20, ... 90). Tags the output row.")
+    p.add_argument("--optimizer-name", type=str, default="adamw",
+                   help="Name of optimizer used (for CSV column)")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--amp", choices=["none", "bf16", "fp16"], default="bf16")
@@ -188,6 +191,7 @@ def main() -> None:
     args.csv_path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not args.csv_path.exists()
     row = {
+        "optimizer": args.optimizer_name,
         "prune_percent": args.prune_percent,
         "checkpoint": str(args.checkpoint),
         "manifest": str(args.val_manifest),
@@ -217,14 +221,18 @@ def main() -> None:
     # ── ROC curve plot ────────────────────────────────────────────────
     args.plots_dir.mkdir(parents=True, exist_ok=True)
     fpr, tpr, _ = roc_curve(labels, scores)
-    plot_path = args.plots_dir / f"prune{int(args.prune_percent)}.png"
+    # Keep the original "prune{N}.png" naming for the default (adamw) sweep so
+    # existing outputs/paths don't change; prefix other optimizers so their
+    # plots never collide with adamw's in the shared results/plots/ directory.
+    plot_stem = f"prune{int(args.prune_percent)}" if args.optimizer_name == "adamw" else f"{args.optimizer_name}_prune{int(args.prune_percent)}"
+    plot_path = args.plots_dir / f"{plot_stem}.png"
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.plot(fpr, tpr, label=f"ROC (AUC = {metrics.roc_auc:.3f})", color="C0", linewidth=2)
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1)
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.set_title(f"ROC Curve — {int(args.prune_percent)}% Pruning")
+    ax.set_title(f"ROC Curve — {args.optimizer_name.upper()} — {int(args.prune_percent)}% Pruning")
     ax.legend(loc="lower right")
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.05)
