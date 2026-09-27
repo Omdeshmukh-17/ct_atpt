@@ -24,6 +24,8 @@ from ct_atpt.losses import detection_loss, focal_loss
 from ct_atpt.metrics import BinaryMetrics, compute_binary_metrics, format_binary_metrics
 from ct_atpt.model import CTATPT, CTATPTConfig
 from ct_atpt.phyadam import PhyAdam
+from ct_atpt.lion import Lion
+from ct_atpt.sam import SAM
 from scripts.load_pretrained import load_imagenet_vit_into_ctatpt
 
 
@@ -153,7 +155,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--optimizer", choices=["adamw", "phyadam"], default="adamw",
+    parser.add_argument("--optimizer", choices=["adamw", "phyadam", "lion", "sam_adamw"], default="adamw",
                         help="Optimizer to use")
     parser.add_argument("--base-mass", type=float, default=1.0,
                         help="PhyAdam: base particle mass M0")
@@ -161,6 +163,14 @@ def parse_args() -> argparse.Namespace:
                         help="PhyAdam: mass scaling coefficient alpha")
     parser.add_argument("--friction", type=float, default=0.1,
                         help="PhyAdam: friction coefficient mu")
+    parser.add_argument("--lion-lr", type=float, default=1e-4,
+                        help="Lion: learning rate (Lion needs ~3-10x smaller lr than AdamW).")
+    parser.add_argument("--lion-weight-decay", type=float, default=1e-2,
+                        help="Lion: weight decay (Lion needs ~3-10x larger weight_decay than AdamW).")
+    parser.add_argument("--lion-beta1", type=float, default=0.9, help="Lion: beta1 (update interpolation).")
+    parser.add_argument("--lion-beta2", type=float, default=0.99, help="Lion: beta2 (momentum EMA).")
+    parser.add_argument("--sam-rho", type=float, default=0.05,
+                        help="SAM+AdamW: neighborhood size rho for the sharpness-aware ascent step.")
     parser.add_argument("--prune-lr-mult", type=float, default=1.0,
                         help="LR multiplier for the pruning scalars (importance_logits/α,β,γ, "
                              "soft_lambda_raw, lambda_raw, temperature_raw). These also get "
@@ -260,6 +270,20 @@ def train_one_epoch(
     use_amp = args.amp != "none" and device.type == "cuda"
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
 
+    is_sam = isinstance(optimizer, SAM)
+    if is_sam and args.grad_accum != 1:
+        raise ValueError(
+            "SAM requires --grad-accum 1 (each optimizer step needs two full "
+            "forward/backward passes over one batch; gradient accumulation "
+            "across multiple batches is not defined for SAM's ascent step)."
+        )
+    if is_sam and args.amp == "fp16":
+        raise ValueError(
+            "SAM does not support --amp fp16 (its ascent/descent steps need "
+            "unscaled gradients — GradScaler is not used in the SAM branch). "
+            "Use --amp bf16 or --amp none instead."
+        )
+
     for step, batch in enumerate(loader):
         batch = move_batch_to_device(batch, device)
 
@@ -275,63 +299,88 @@ def train_one_epoch(
         # distribution rather than integer classes); focal is incompatible with both.
         soft_path = args.soft_labels or mixup_active
 
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits, aux = model(volume)
+        def compute_loss() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                logits, aux = model(volume)
 
-            if soft_path:
-                target_probs = build_target_probs(batch, args)
-                if mixup_active:
-                    target_probs = lam * target_probs + (1.0 - lam) * target_probs[perm]
-                cls_loss = soft_cross_entropy(logits, target_probs)
-            elif args.cls_loss == "focal":
-                cls_loss = focal_loss(
-                    logits, batch["label"],
-                    gamma=args.focal_gamma,
-                    alpha=args.focal_alpha,
+                if soft_path:
+                    target_probs = build_target_probs(batch, args)
+                    if mixup_active:
+                        target_probs = lam * target_probs + (1.0 - lam) * target_probs[perm]
+                    cls_loss = soft_cross_entropy(logits, target_probs)
+                elif args.cls_loss == "focal":
+                    cls_loss = focal_loss(
+                        logits, batch["label"],
+                        gamma=args.focal_gamma,
+                        alpha=args.focal_alpha,
+                    )
+                else:
+                    cls_loss = F.cross_entropy(
+                        logits, batch["label"], label_smoothing=args.label_smoothing
+                    )
+                # Detection loss uses the original (unmixed) targets; it is degenerate
+                # on this dataset and typically run with --det-weight 0.
+                det_loss = detection_loss(
+                    aux["det_pred"],
+                    aux["grid_shape"],
+                    batch["det_target"],
+                    batch["has_det"],
+                    focal_gamma=args.focal_gamma,
                 )
-            else:
-                cls_loss = F.cross_entropy(
-                    logits, batch["label"], label_smoothing=args.label_smoothing
+                total_loss = (
+                    cls_loss
+                    + args.det_weight * det_loss
+                    + args.entropy_weight * aux["entropy_loss"]
+                    + args.consistency_weight * aux["consistency_loss"]
+                    + args.sparsity_weight * aux["sparsity_loss"]
                 )
-            # Detection loss uses the original (unmixed) targets; it is degenerate
-            # on this dataset and typically run with --det-weight 0.
-            det_loss = detection_loss(
-                aux["det_pred"],
-                aux["grid_shape"],
-                batch["det_target"],
-                batch["has_det"],
-                focal_gamma=args.focal_gamma,
-            )
-            loss = (
-                cls_loss
-                + args.det_weight * det_loss
-                + args.entropy_weight * aux["entropy_loss"]
-                + args.consistency_weight * aux["consistency_loss"]
-                + args.sparsity_weight * aux["sparsity_loss"]
-            )
-            loss = loss / args.grad_accum
+            return total_loss, cls_loss, det_loss, aux
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
+        if is_sam:
+            # Pass 1: gradient at theta locates the worst point within the
+            # rho-ball (first_step climbs there). Pass 2: gradient at that
+            # perturbed point is what AdamW actually steps with (second_step
+            # undoes the climb first). No grad accumulation, no AMP GradScaler
+            # (bf16/none only) — SAM's ascent step needs unscaled gradients.
+            loss, cls_loss, det_loss, aux = compute_loss()
             loss.backward()
+            optimizer.first_step(zero_grad=True)
 
-        should_step = (step + 1) % args.grad_accum == 0 or (step + 1) == len(loader)
-        if should_step:
-            if scaler is not None:
-                if args.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+            loss2, _cls_loss2, _det_loss2, _aux2 = compute_loss()
+            loss2.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.second_step(zero_grad=True)
             scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
             if ema is not None:
                 ema.update(model)
+            step_loss_value = loss.item()
+        else:
+            loss, cls_loss, det_loss, aux = compute_loss()
+            loss = loss / args.grad_accum
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            should_step = (step + 1) % args.grad_accum == 0 or (step + 1) == len(loader)
+            if should_step:
+                if scaler is not None:
+                    if args.grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                if ema is not None:
+                    ema.update(model)
+            step_loss_value = loss.item() * args.grad_accum
 
         if is_main_process(rank) and step % 10 == 0:
             keep = aux["keep_ratios"].detach().float().cpu().tolist()
@@ -340,7 +389,7 @@ def train_one_epoch(
             lr   = scheduler.get_last_lr()[0]
             print(
                 f"epoch={epoch:03d} step={step:04d} lr={lr:.2e} "
-                f"loss={(loss.item() * args.grad_accum):.4f} "
+                f"loss={step_loss_value:.4f} "
                 f"cls={cls_loss.item():.4f} det={det_loss.item():.4f} "
                 f"ent={aux['entropy_loss'].item():.4f} "
                 f"con={aux['consistency_loss'].item():.4f} "
@@ -531,6 +580,27 @@ def main() -> None:
             base_mass=args.base_mass,
             mass_scale=args.mass_scale,
             friction=args.friction,
+        )
+    elif args.optimizer == "lion":
+        optimizer = Lion(
+            [
+                {"params": other_params, "weight_decay": args.lion_weight_decay, "lr": args.lion_lr},
+                {"params": prune_params, "weight_decay": 0.0, "lr": args.lion_lr * args.prune_lr_mult},
+            ],
+            lr=args.lion_lr,
+            betas=(args.lion_beta1, args.lion_beta2),
+            weight_decay=args.lion_weight_decay,
+        )
+    elif args.optimizer == "sam_adamw":
+        optimizer = SAM(
+            [
+                {"params": other_params, "weight_decay": args.weight_decay, "lr": args.lr, "rho": args.sam_rho},
+                {"params": prune_params, "weight_decay": 0.0, "lr": args.lr * args.prune_lr_mult, "rho": args.sam_rho},
+            ],
+            base_optimizer=torch.optim.AdamW,
+            rho=args.sam_rho,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
         )
     else:
         optimizer = torch.optim.AdamW(

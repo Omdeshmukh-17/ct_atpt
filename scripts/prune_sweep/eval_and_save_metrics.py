@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from sklearn.metrics import roc_curve
 from torch.utils.data import DataLoader, SequentialSampler
@@ -39,6 +40,7 @@ from ct_atpt.model import CTATPT, CTATPTConfig
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 CSV_PATH = RESULTS_DIR / "all_prune_metrics.csv"
 PLOTS_DIR = RESULTS_DIR / "plots"
+SCORES_DIR = RESULTS_DIR / "scores"
 
 CSV_FIELDS = [
     "optimizer",
@@ -80,6 +82,8 @@ def parse_args() -> argparse.Namespace:
                    help="Flip test-time augmentation (averages probs over 8 axis-flip views).")
     p.add_argument("--csv-path", type=Path, default=CSV_PATH, help="Shared metrics CSV to append to.")
     p.add_argument("--plots-dir", type=Path, default=PLOTS_DIR, help="Directory for per-run ROC curve PNGs.")
+    p.add_argument("--scores-dir", type=Path, default=SCORES_DIR,
+                   help="Directory for per-run raw labels/scores .npz files (one per optimizer/pruning-%%).")
     return p.parse_args()
 
 
@@ -218,14 +222,36 @@ def main() -> None:
         writer.writerow(row)
     print(f"\nAppended row to {args.csv_path}")
 
+    # ── Raw labels/scores (.npz) ──────────────────────────────────────
+    # One file per optimizer/pruning-percent so later analyses (custom plots,
+    # DeLong tests, etc.) don't need to re-run inference.
+    scores_dir = args.scores_dir / args.optimizer_name
+    scores_dir.mkdir(parents=True, exist_ok=True)
+    scores_path = scores_dir / f"prune{int(args.prune_percent)}.npz"
+    np.savez(
+        scores_path,
+        labels=np.asarray(labels, dtype=np.int64),
+        scores=np.asarray(scores, dtype=np.float64),
+        prune_percent=args.prune_percent,
+        optimizer=args.optimizer_name,
+    )
+    print(f"Saved raw scores to {scores_path}")
+
     # ── ROC curve plot ────────────────────────────────────────────────
-    args.plots_dir.mkdir(parents=True, exist_ok=True)
+    # Keep the original flat "prune{N}.png" (adamw) / "phyadam_prune{N}.png"
+    # naming and location exactly as before, so existing outputs/paths for
+    # those two optimizers don't change. Newer optimizers (lion, sam_adamw,
+    # ...) get their own results/plots/<optimizer>/ subdirectory instead, so
+    # the shared plots/ dir doesn't accumulate one prefix per optimizer.
+    if args.optimizer_name in ("adamw", "phyadam"):
+        plot_dir = args.plots_dir
+        plot_stem = f"prune{int(args.prune_percent)}" if args.optimizer_name == "adamw" else f"{args.optimizer_name}_prune{int(args.prune_percent)}"
+    else:
+        plot_dir = args.plots_dir / args.optimizer_name
+        plot_stem = f"prune{int(args.prune_percent)}"
+    plot_dir.mkdir(parents=True, exist_ok=True)
     fpr, tpr, _ = roc_curve(labels, scores)
-    # Keep the original "prune{N}.png" naming for the default (adamw) sweep so
-    # existing outputs/paths don't change; prefix other optimizers so their
-    # plots never collide with adamw's in the shared results/plots/ directory.
-    plot_stem = f"prune{int(args.prune_percent)}" if args.optimizer_name == "adamw" else f"{args.optimizer_name}_prune{int(args.prune_percent)}"
-    plot_path = args.plots_dir / f"{plot_stem}.png"
+    plot_path = plot_dir / f"{plot_stem}.png"
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.plot(fpr, tpr, label=f"ROC (AUC = {metrics.roc_auc:.3f})", color="C0", linewidth=2)
