@@ -102,6 +102,15 @@ def main() -> None:
     print(f"Checkpoint from epoch {ckpt.get('epoch', '?')}")
     print(f"Saved best metric value: {ckpt.get('best_metric_value', '?')}")
 
+    # Independent per-stage keep targets (bayesian_prune_search.py / manual
+    # --prune-keep-stage1/2/3 runs): all-or-nothing, same as at train time.
+    _stage_vals = (
+        saved_args.get("prune_keep_stage1"),
+        saved_args.get("prune_keep_stage2"),
+        saved_args.get("prune_keep_stage3"),
+    )
+    prune_stage_keep_targets = tuple(_stage_vals) if all(v is not None for v in _stage_vals) else None
+
     # ── Reconstruct model config from saved args ─────────────────────
     config = CTATPTConfig(
         input_shape=(
@@ -128,6 +137,7 @@ def main() -> None:
         # dict) and prune_target_keep sets the eval-time lambda schedule, so
         # omitting them silently evaluates soft checkpoints with wrong gates.
         prune_target_keep=saved_args.get("prune_target_keep", 0.5),
+        prune_stage_keep_targets=prune_stage_keep_targets,
         prune_ramp_epochs=saved_args.get("prune_ramp_epochs", 15),
         soft_lambda_init=saved_args.get("soft_lambda_init", -2.0),
         gate_sharpness=saved_args.get("gate_sharpness", 10.0),

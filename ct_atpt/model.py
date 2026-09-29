@@ -138,6 +138,14 @@ class CTATPTConfig:
     pruning_warmup_epochs: int = 10
     # "soft" mode only: gentle keep-ratio curriculum (differentiable, learnable).
     prune_target_keep: float = 0.5
+    # "adaptive" mode only: independent final cumulative keep fraction (of the
+    # ORIGINAL T tokens) for each of the 3 stage blocks, e.g. (0.6, 0.3, 0.1).
+    # None (default) preserves the original behavior: every stage's target is
+    # derived from the single `prune_target_keep` via geometric compounding
+    # (target ** (stage_rank / num_stages)) — existing configs/checkpoints are
+    # unaffected. When set, must have exactly len(prune stage list) entries
+    # (3 for the default depth=12 staging at blocks {3, 6, 9}).
+    prune_stage_keep_targets: tuple[float, ...] | None = None
     prune_ramp_epochs: int   = 15
     soft_lambda_init:  float = -2.0   # less negative => gates start responsive (not saturated)
     gate_sharpness:    float = 10.0   # kappa; lower => softer gates, more gradient flow
@@ -244,6 +252,17 @@ class CTATPT(nn.Module):
         )
         self._prune_stage_set: set[int] = set(self._prune_stage_list)
 
+        if config.prune_stage_keep_targets is not None:
+            n_given = len(config.prune_stage_keep_targets)
+            n_stages = len(self._prune_stage_list)
+            if n_given != n_stages:
+                raise ValueError(
+                    f"prune_stage_keep_targets has {n_given} entries but this "
+                    f"model has {n_stages} pruning stages (blocks "
+                    f"{self._prune_stage_list}) — pass exactly one keep "
+                    f"fraction per stage."
+                )
+
         self._current_epoch: int = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -267,18 +286,55 @@ class CTATPT(nn.Module):
         lam_sched = lam_start + frac * (lam_end - lam_start)
         return lam_sched + torch.tanh(self.soft_lambda_raw) * 0.25     # small learnable residual
 
-    def _adaptive_effective_lambda(self) -> torch.Tensor:
+    def _stage_final_cum_frac(self, stage_rank: int) -> float:
+        """Final (fully-ramped) cumulative keep fraction of the ORIGINAL T
+        tokens surviving through stage `stage_rank` (1-indexed).
+
+        Default (config.prune_stage_keep_targets is None): the original
+        geometric-compounding formula from the single network-level target.
+        Override: reads stage_rank-1 directly from prune_stage_keep_targets —
+        an independent, non-compounding cumulative target per stage.
+        """
+        per_stage = self.config.prune_stage_keep_targets
+        if per_stage is not None:
+            return float(per_stage[stage_rank - 1])
+        num_stages = max(1, len(self._prune_stage_list))
+        return float(self.config.prune_target_keep) ** (stage_rank / num_stages)
+
+    def _adaptive_effective_lambda(self, stage_rank: int) -> torch.Tensor:
         """Effective adaptive-mode threshold scalar: scheduled + learnable residual.
 
-        lam_sched targets the per-stage keep fraction rho(epoch)^(1/num_stages)
-        via keep = P(score > mu + lam*sigma) => lam = ndtri(1 - keep).
+        Default path (prune_stage_keep_targets is None): reproduces the
+        original formula exactly — a single relative per-stage shrink
+        rho(epoch)^(1/num_stages), the same value at every stage regardless
+        of stage_rank (tau operates on tokens REMAINING at that stage; the
+        cumulative budget clamp in _prune_after_block is what prevents this
+        per-stage relative shrink from compounding into budget drift).
+
+        Override path: each stage gets its OWN relative shrink, derived from
+        the ratio of its final cumulative target to the previous stage's
+        final cumulative target (final_frac_0 := 1.0), so independent
+        per-stage targets translate into independent thresholds instead of
+        all stages sharing one relative shrink value.
         """
         warm = self.config.pruning_warmup_epochs
         ramp = max(1, self.config.prune_ramp_epochs)
         frac = min(1.0, max(0.0, (self._current_epoch - warm) / ramp))
-        rho  = 1.0 - frac * (1.0 - float(self.config.prune_target_keep))
-        num_stages = max(1, len(self._prune_stage_list))
-        stage_frac = min(max(rho ** (1.0 / num_stages), 1e-4), 1.0 - 1e-4)
+
+        if self.config.prune_stage_keep_targets is None:
+            rho  = 1.0 - frac * (1.0 - float(self.config.prune_target_keep))
+            num_stages = max(1, len(self._prune_stage_list))
+            stage_frac = min(max(rho ** (1.0 / num_stages), 1e-4), 1.0 - 1e-4)
+        else:
+            final_frac_this = self._stage_final_cum_frac(stage_rank)
+            final_frac_prev = 1.0 if stage_rank == 1 else self._stage_final_cum_frac(stage_rank - 1)
+            final_relative = final_frac_this / max(final_frac_prev, 1e-8)
+            # Ramp this stage's relative shrink the same way the network-level
+            # rho ramps in the default path: 1.0 (no pruning) at frac=0, the
+            # final relative value at frac=1.
+            relative_now = 1.0 - frac * (1.0 - final_relative)
+            stage_frac = min(max(relative_now, 1e-4), 1.0 - 1e-4)
+
         lam_sched  = float(torch.special.ndtri(torch.tensor(1.0 - stage_frac)))
         return lam_sched + torch.tanh(self.lambda_raw) * 0.25
 
@@ -381,10 +437,17 @@ class CTATPT(nn.Module):
         warm = self.config.pruning_warmup_epochs
         ramp = max(1, self.config.prune_ramp_epochs)
         frac = min(1.0, max(0.0, (self._current_epoch - warm) / ramp))
-        rho  = 1.0 - frac * (1.0 - float(self.config.prune_target_keep))
         num_stages = max(1, len(self._prune_stage_list))
         stage_rank = self._prune_stage_list.index(block_idx) + 1
-        cum_target = (rho ** (stage_rank / num_stages)) * T
+        if self.config.prune_stage_keep_targets is None:
+            rho  = 1.0 - frac * (1.0 - float(self.config.prune_target_keep))
+            cum_target = (rho ** (stage_rank / num_stages)) * T
+        else:
+            # Independent per-stage target: ramp THIS stage's own final
+            # cumulative fraction directly from 1.0, no compounding through
+            # other stages' targets.
+            final_frac = self._stage_final_cum_frac(stage_rank)
+            cum_target = (1.0 - frac * (1.0 - final_frac)) * T
 
         # ── Per-sample adaptive threshold ─────────────────────────────
         n_active = active_f.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -399,7 +462,7 @@ class CTATPT(nn.Module):
         # the band ceiling). Scheduling puts tau inside the band by
         # construction; the residual and the score distribution's shape
         # decide the per-sample counts within it.
-        lam  = self._adaptive_effective_lambda()
+        lam  = self._adaptive_effective_lambda(stage_rank)
         tau  = mean_s + lam * std_s                               # [B, 1]
 
         gate = torch.sigmoid(self.gate_sharpness * (scores - tau)) * active_f  # [B, T]
@@ -679,7 +742,9 @@ class CTATPT(nn.Module):
         if self.config.pruning_mode == "soft":
             lambda_report = self._soft_effective_lambda().detach()
         else:
-            lambda_report = self._adaptive_effective_lambda().detach()
+            # Summary/logging value only (aux["lambda"] in the per-step print);
+            # report the last stage's threshold, matching the finest pruning point.
+            lambda_report = self._adaptive_effective_lambda(len(self._prune_stage_list)).detach()
         aux = {
             "det_pred":         det_pred,
             "grid_shape":       self.grid_shape,

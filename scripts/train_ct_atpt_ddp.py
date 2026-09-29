@@ -137,6 +137,14 @@ def parse_args() -> argparse.Namespace:
                         help="Train without pruning for this many epochs so the backbone learns features first.")
     parser.add_argument("--prune-target-keep", type=float, default=0.5,
                         help="(soft & adaptive modes) final fraction of patch tokens to keep after the ramp.")
+    parser.add_argument("--prune-keep-stage1", type=float, default=None,
+                        help="(adaptive mode) independent final cumulative keep fraction at stage 1 "
+                             "(block depth//4). Overrides --prune-target-keep's compounding formula "
+                             "for this stage. Must be given together with --prune-keep-stage2/3.")
+    parser.add_argument("--prune-keep-stage2", type=float, default=None,
+                        help="(adaptive mode) independent final cumulative keep fraction at stage 2 (block depth//2).")
+    parser.add_argument("--prune-keep-stage3", type=float, default=None,
+                        help="(adaptive mode) independent final cumulative keep fraction at stage 3 (block 3*depth//4).")
     parser.add_argument("--prune-ramp-epochs", type=int, default=15,
                         help="(soft & adaptive modes) epochs to ramp keep-ratio from 1.0 down to --prune-target-keep, starting after warmup.")
     parser.add_argument("--sparsity-weight", type=float, default=0.5,
@@ -518,6 +526,15 @@ def main() -> None:
             pin_memory=device.type == "cuda",
         )
 
+    stage_keep_args = (args.prune_keep_stage1, args.prune_keep_stage2, args.prune_keep_stage3)
+    n_stage_args_given = sum(v is not None for v in stage_keep_args)
+    if n_stage_args_given not in (0, 3):
+        raise ValueError(
+            "--prune-keep-stage1/2/3 must be given all together or not at all "
+            f"(got {n_stage_args_given} of 3)."
+        )
+    prune_stage_keep_targets = tuple(stage_keep_args) if n_stage_args_given == 3 else None
+
     config = CTATPTConfig(
         input_shape=(args.depth, args.height, args.width),
         patch_size=(args.patch_z, args.patch_y, args.patch_x),
@@ -533,6 +550,7 @@ def main() -> None:
         scale_kept_tokens=args.scale_kept_tokens,
         pruning_warmup_epochs=args.pruning_warmup_epochs,
         prune_target_keep=args.prune_target_keep,
+        prune_stage_keep_targets=prune_stage_keep_targets,
         prune_ramp_epochs=args.prune_ramp_epochs,
         soft_lambda_init=args.soft_lambda_init,
         gate_sharpness=args.gate_sharpness,
