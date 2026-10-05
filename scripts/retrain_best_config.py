@@ -26,7 +26,7 @@ import optuna
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SWEEP_DIR = PROJECT_ROOT / "scripts" / "prune_sweep"
 DEFAULT_SPLITS_DIR = SWEEP_DIR / "splits_tvt"
-DEFAULT_STUDY_DB = PROJECT_ROOT / "results" / "optuna_prune_search.db"
+DEFAULT_STUDY_DB = PROJECT_ROOT / "results" / "optuna_prune_search_v2.db"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "bayesian_optimal"
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results" / "bayesian_optimal"
 
@@ -67,8 +67,20 @@ def load_best_config(study_db: Path) -> dict:
     if not study_db.exists():
         raise FileNotFoundError(f"No study database at {study_db} — run scripts/bayesian_prune_search.py first.")
     study = optuna.load_study(study_name="ct_atpt_prune_search", storage=f"sqlite:///{study_db}")
-    best = study.best_trial
-    print(f"Best trial #{best.number}: value={best.value:.4f} params={best.params}")
+
+    def score(t):
+        if t.value is not None:
+            return float(t.value)
+        return float(t.intermediate_values[max(t.intermediate_values)]) if t.intermediate_values else None
+
+    # Warm-start rows come from the full 45-epoch uniform sweep, a different fidelity than the short
+    # search trials, so they would always win. Pick the best config the search itself trained.
+    ok = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+    searched = [t for t in study.trials if t.user_attrs.get("searched") and t.state in ok and score(t) is not None]
+    if not searched:
+        raise RuntimeError("No trained search trial found in the study - run scripts/bayesian_prune_search.py first.")
+    best = max(searched, key=score)
+    print(f"Best searched trial #{best.number}: value={score(best):.4f} params={best.params}")
     return best.params
 
 

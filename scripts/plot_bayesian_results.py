@@ -29,7 +29,7 @@ import optuna
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SWEEP_DIR = PROJECT_ROOT / "scripts" / "prune_sweep"
-DEFAULT_STUDY_DB = PROJECT_ROOT / "results" / "optuna_prune_search.db"
+DEFAULT_STUDY_DB = PROJECT_ROOT / "results" / "optuna_prune_search_v2.db"
 DEFAULT_UNIFORM_CSV = SWEEP_DIR / "results" / "all_prune_metrics.csv"
 DEFAULT_OUT_DIR = PROJECT_ROOT / "results" / "plots" / "bayesian"
 
@@ -124,15 +124,26 @@ def main() -> None:
     if not args.study_db.exists():
         raise FileNotFoundError(f"No study database at {args.study_db} — run scripts/bayesian_prune_search.py first.")
     study = optuna.load_study(study_name="ct_atpt_prune_search", storage=f"sqlite:///{args.study_db}")
-    print(f"Loaded study with {len(study.trials)} trial(s). Best value: {study.best_value:.4f}")
-    print(f"Best params: {study.best_params}")
+    ok = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+
+    def score(t):
+        if t.value is not None:
+            return float(t.value)
+        return float(t.intermediate_values[max(t.intermediate_values)]) if t.intermediate_values else None
+
+    # Compare against trials the search actually trained (warm-start rows are full-sweep results).
+    searched = [t for t in study.trials if t.user_attrs.get("searched") and t.state in ok and score(t) is not None]
+    best_searched = max(searched, key=score) if searched else None
+    print(f"Loaded study with {len(study.trials)} trial(s), {len(searched)} trained by the search.")
+    if best_searched is not None:
+        print(f"Best searched value: {score(best_searched):.4f}  params: {best_searched.params}")
 
     save_optuna_plots(study, args.out_dir)
 
     best_uniform, best_uniform_pct = best_uniform_accuracy(args.uniform_csv, args.metric)
     if best_uniform is not None:
         print(f"Best uniform-sweep {args.metric}: {best_uniform:.4f} (at {best_uniform_pct:.0f}% pruned)")
-    plot_uniform_vs_bayesian(best_uniform, study.best_value, args.metric, args.out_dir)
+    plot_uniform_vs_bayesian(best_uniform, score(best_searched) if best_searched else None, args.metric, args.out_dir)
 
     print(f"\nAll plots written to {args.out_dir}")
 

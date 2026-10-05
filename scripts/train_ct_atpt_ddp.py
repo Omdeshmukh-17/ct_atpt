@@ -101,7 +101,7 @@ def build_cosine_schedule_with_warmup(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train CT-ATPT with PyTorch DDP.")
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, default=None)
@@ -219,7 +219,7 @@ def parse_args() -> argparse.Namespace:
                         help="Random seed for weight init, dropout, shuffling and MixUp. "
                              "Without this, runs are not comparable (warmup AUC alone can "
                              "swing by 0.2 on this dataset).")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def set_seed(seed: int, rank: int) -> None:
@@ -485,8 +485,12 @@ def save_checkpoint(
     torch.save(ckpt, args.output_dir / (filename or f"checkpoint_epoch_{epoch:03d}.pt"))
 
 
-def main() -> None:
-    args = parse_args()
+def main(args: argparse.Namespace | None = None, epoch_callback=None) -> None:
+    """Train. `args`/`epoch_callback` let another script (bayesian_prune_search.py)
+    run this in-process: epoch_callback(epoch, val_metrics) is called after each
+    validation pass and may raise to stop training early."""
+    if args is None:
+        args = parse_args()
     rank, world_size, local_rank, device = setup_distributed()
     set_seed(args.seed, rank)
 
@@ -753,6 +757,9 @@ def main() -> None:
                     )
                     tag = "ema" if best_is_ema else "raw"
                     print(f"new_best_{args.best_metric}={best_value:.4f} ({tag})")
+
+        if epoch_callback is not None and val_loader is not None and is_main_process(rank):
+            epoch_callback(epoch, best_metrics)
 
         # Only save best checkpoint — no per-epoch saves to conserve storage.
 
