@@ -3,7 +3,7 @@
 Each trial trains a cheap surrogate IN-PROCESS (no subprocess, so no GPU memory
 piling up across trials) for a few epochs at half the normal batch size, reports
 validation accuracy after every epoch, and lets Optuna's Hyperband pruner kill
-unpromising configs at epoch 3. Warm-started from the 9 uniform AdamW sweep
+unpromising configs at epoch 5 (--early-stop-epoch). Warm-started from the 9 uniform AdamW sweep
 points. Everything lives in an sqlite study, so a crash/restart resumes where it
 stopped and only runs the trials still missing.
 
@@ -76,10 +76,13 @@ def parse_args() -> argparse.Namespace:
                    help="Optional persistent dir (e.g. on Drive). The study DB and summary CSV are copied "
                         "here after every trial, and restored from here if the local DB is missing.")
     p.add_argument("--n-trials", type=int, default=8, help="New configs to actually train (beyond the warm-start points).")
-    p.add_argument("--epochs", type=int, default=8, help="Max epochs per trial (Hyperband max_resource).")
+    p.add_argument("--epochs", type=int, default=10, help="Max epochs per trial (Hyperband max_resource).")
+    p.add_argument("--early-stop-epoch", type=int, default=5,
+                   help="Epochs every trial trains before Hyperband may stop it (Hyperband min_resource).")
     # The 8-epoch surrogate needs a compressed schedule, otherwise pruning would never switch on
     # before the epoch-3 pruning decision and every config would look identical.
-    p.add_argument("--pruning-warmup-epochs", type=int, default=1)
+    p.add_argument("--pruning-warmup-epochs", type=int, default=5,
+                   help="Pruning-free epochs at the start of each trial.")
     p.add_argument("--prune-ramp-epochs", type=int, default=1)
     p.add_argument("--warmup-epochs", type=int, default=2, help="LR warmup epochs (scaled down for the short run).")
     p.add_argument("--batch-size", type=int, default=4,
@@ -257,6 +260,13 @@ def main() -> None:
             f"Missing {missing} under {splits_dir}. Run scripts/prune_sweep/run_full_sweep.py "
             "(or make_train_val_test.py) first to build the split this search reuses."
         )
+    if not 1 <= args.early_stop_epoch < args.epochs:
+        raise ValueError("--early-stop-epoch must be at least 1 and smaller than --epochs")
+    first_informative = args.pruning_warmup_epochs + args.prune_ramp_epochs + 1
+    if args.early_stop_epoch < first_informative:
+        print(f"WARNING: pruning reaches full strength only in epoch {first_informative} (1-indexed), but the first "
+              f"early-stop check is after {args.early_stop_epoch} epochs, so every config looks identical at that "
+              f"check and it cannot rank them. Use --early-stop-epoch >= {first_informative} for it to be informative.")
     search_batch = max(1, args.batch_size // 2)
     print(f"Search trials: batch_size={search_batch} (half of {args.batch_size}), grad_accum={args.grad_accum}, "
           f"max {args.epochs} epochs, metric={args.metric}")
@@ -271,7 +281,7 @@ def main() -> None:
         direction="maximize",
         study_name=STUDY_NAME,
         sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.HyperbandPruner(min_resource=3, max_resource=args.epochs, reduction_factor=3),
+        pruner=optuna.pruners.HyperbandPruner(min_resource=args.early_stop_epoch, max_resource=args.epochs, reduction_factor=3),
         storage=f"sqlite:///{args.study_db}",
         load_if_exists=True,
     )
@@ -304,7 +314,7 @@ def main() -> None:
         def on_epoch(epoch: int, metrics) -> None:
             value = float(getattr(metrics, args.metric))
             last["value"] = value
-            trial.report(value, step=epoch + 1)  # step = epochs completed, so Hyperband's rung 3 == "after epoch 3"
+            trial.report(value, step=epoch + 1)  # step = epochs completed, so the first Hyperband rung is "after --early-stop-epoch epochs"
             if trial.should_prune():
                 raise optuna.TrialPruned(f"pruned after epoch {epoch + 1} ({args.metric}={value:.4f})")
 
